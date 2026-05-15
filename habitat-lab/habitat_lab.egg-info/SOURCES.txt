@@ -28,10 +28,6 @@ habitat/config/__init__.py
 habitat/config/default.py
 habitat/config/default_structured_configs.py
 habitat/config/read_write.py
-habitat/config/__pycache__/__init__.cpython-39.pyc
-habitat/config/__pycache__/default.cpython-39.pyc
-habitat/config/__pycache__/default_structured_configs.cpython-39.pyc
-habitat/config/__pycache__/read_write.cpython-39.pyc
 habitat/config/benchmark/multi_agent/hssd_spot_human.yaml
 habitat/config/benchmark/multi_agent/hssd_spot_human_social_nav.yaml
 habitat/config/benchmark/multi_agent/pddl/multi_agent_social_nav.yaml

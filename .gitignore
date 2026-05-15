@@ -2,6 +2,8 @@ habitat-lab
 data/humanoids
 data/sample
 data/scene_datasets
+data
+
 ckpt_qwen5
 __pycache__/
 *.pyc
@@ -20,8 +22,14 @@ ckpt*/
 *.npy
 *.npz
 
+*.glb
+*.jpg
+
 habitat-sim/
 pretrained_model/
 sim_data/
 
 open_trackvla_hf
+
+sim_data
+

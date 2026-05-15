@@ -1,12 +1,13 @@
 CHUNKS=30 #将所有的分成30块来跑
-NUM_PARALLEL=1
+NUM_PARALLEL=3
 SAVE_PATH="sim_data/eval/stt"
-DINO_MODEL=facebook/dinov3-vits16-pretrain-lvd1689m
+export HF_MODEL_DIR="/data/hdt/newtrackvla/open_trackvla_hf"
+export DINOV3_MODEL_PATH="/data/hdt/newtrackvla/weights/dinov3"
 
-if [ -n "${HF_MODEL_DIR:-}" ]; then
-    export HF_MODEL_DIR
-    echo "[eval] Using HuggingFace planner weights from ${HF_MODEL_DIR}"
-fi
+# if [ -n "${HF_MODEL_DIR:-}" ]; then
+#     export HF_MODEL_DIR
+#     echo "[eval] Using HuggingFace planner weights from ${HF_MODEL_DIR}"
+# fi
 
 IDX=0
 while [ $IDX -lt $CHUNKS ]; do

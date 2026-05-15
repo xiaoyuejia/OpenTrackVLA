@@ -228,20 +228,44 @@ class VisionCacheConfig:
     force_square_resize: bool = True    # ensure exact 384x384
     use_modelscope: bool = None  # Will be set from env or default to True
 
-    def __post_init__(self):
-        # Check environment variable for ModelScope usage (default: True)
-        if self.use_modelscope is None:
-            env_ms = os.getenv("USE_MODELSCOPE", "1").strip().lower()
-            self.use_modelscope = env_ms in ("1", "true", "yes")
+    # def __post_init__(self):
+    #     # Check environment variable for ModelScope usage (default: True)
+    #     if self.use_modelscope is None:
+    #         env_ms = os.getenv("USE_MODELSCOPE", "1").strip().lower()
+    #         self.use_modelscope = env_ms in ("1", "true", "yes")
 
-        # Check environment variable for local DINOv3 model path
+    #     # Check environment variable for local DINOv3 model path
+    #     if self.dino_model_name is None:
+    #         env_path = os.getenv("DINOV3_MODEL_PATH", "").strip()
+    #         if env_path and os.path.exists(env_path):
+    #             self.dino_model_name = env_path
+    #         else:
+    #             self.dino_model_name = "facebook/dinov3-vits16-pretrain-lvd1689m"
+    def __post_init__(self):
+        # 1. 检查 DINOv3
         if self.dino_model_name is None:
             env_path = os.getenv("DINOV3_MODEL_PATH", "").strip()
+            # 打印一下，看看程序到底拿到了什么环境变量
+            print(f"[DEBUG] DINOV3_MODEL_PATH env is: '{env_path}'")
+            
             if env_path and os.path.exists(env_path):
                 self.dino_model_name = env_path
+                print(f"[SUCCESS] Using local DINO: {self.dino_model_name}")
             else:
-                self.dino_model_name = "facebook/dinov3-vits16-pretrain-lvd1689m"
+                # 如果环境变量失效，手动强行指向你的本地路径，不给它联网的机会
+                local_fallback = "/data/hdt/newtrackvla/weights/dinov3"
+                if os.path.exists(local_fallback):
+                    self.dino_model_name = local_fallback
+                else:
+                    self.dino_model_name = "facebook/dinov3-vits16-pretrain-lvd1689m"
+                    print(f"[WARNING] Local path not found, will try to download...")
 
+        # 2. 检查 SigLIP (建议也用绝对路径)
+        if not os.path.exists(self.siglip_model_name):
+            # 如果 ./weights/siglip 找不到，尝试绝对路径
+            abs_siglip = "/data/hdt/newtrackvla/weights/siglip"
+            if os.path.exists(abs_siglip):
+                self.siglip_model_name = abs_siglip
 
 class VisionFeatureCacher(nn.Module):
     def __init__(self, cfg: VisionCacheConfig):

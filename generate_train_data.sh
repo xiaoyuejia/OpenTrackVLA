@@ -18,7 +18,8 @@
 #   --num-parallel      并行进程数 (默认: 4)
 #   --seed              随机种子 (默认: 100)
 #   --output            输出目录 (默认: data/generated)
-#   --min-following-rate 最小跟踪率阈值 (默认: 0.4, 范围 0-1)
+#   --min-following-rate 最小跟踪率阈值 (默认: 0.7, 范围 0-1)
+#   --min-total-steps   最小episode步数 (默认: 40)
 #   --no-exclude-collision 不排除碰撞episode (默认: 排除碰撞)
 #
 # 示例:
@@ -26,7 +27,7 @@
 #   bash generate_train_data.sh --num-episodes 5000 --num-parallel 8
 #
 #   # 使用更严格的筛选
-#   bash generate_train_data.sh --min-following-rate 0.5
+#   bash generate_train_data.sh --min-following-rate 0.7 --min-total-steps 40
 #
 #   # 仅采集数据
 #   bash generate_train_data.sh --mode collect --num-episodes 1000
@@ -41,15 +42,16 @@ set -e
 # 默认参数
 MODE="all"
 CONFIG="habitat-lab/habitat/config/benchmark/nav/track/track_train_stt.yaml"
-NUM_EPISODES=1000
+NUM_EPISODES=10
 NUM_PARALLEL=1
-SEED=42
+SEED=100
 OUTPUT_DIR="data/sample"
-SIM_DATA_DIR="sim_data/train"
+SIM_DATA_DIR="sim_data/stt_traintest"
 INSTRUCTION="Follow the target person without collision."
 # 数据筛选参数 (新增)
-MIN_FOLLOWING_RATE=0.4
+MIN_FOLLOWING_RATE=0.7
 EXCLUDE_COLLISION=true
+MIN_TOTAL_STEPS=50
 
 # 解析命令行参数
 while [[ $# -gt 0 ]]; do
@@ -90,6 +92,10 @@ while [[ $# -gt 0 ]]; do
             MIN_FOLLOWING_RATE="$2"
             shift 2
             ;;
+        --min-total-steps)
+            MIN_TOTAL_STEPS="$2"
+            shift 2
+            ;;
         --no-exclude-collision)
             EXCLUDE_COLLISION=false
             shift
@@ -121,6 +127,7 @@ echo "Sim Data Dir:   $SIM_DATA_DIR"
 echo "Output Dir:     $OUTPUT_DIR"
 echo "Instruction:    $INSTRUCTION"
 echo "Min Follow Rate: $MIN_FOLLOWING_RATE"
+echo "Min Total Steps: $MIN_TOTAL_STEPS"
 echo "Exclude Collision: $EXCLUDE_COLLISION"
 echo "=============================================="
 
@@ -204,7 +211,7 @@ process_data() {
     echo "=============================================="
 
     # 构建筛选参数
-    FILTER_ARGS="--only_success --min_following_rate $MIN_FOLLOWING_RATE"
+    FILTER_ARGS="--only_success --min_following_rate $MIN_FOLLOWING_RATE --min_total_steps $MIN_TOTAL_STEPS"
     if [ "$EXCLUDE_COLLISION" = true ]; then
         FILTER_ARGS="$FILTER_ARGS --exclude_collision"
     fi

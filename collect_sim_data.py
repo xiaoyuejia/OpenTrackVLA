@@ -27,9 +27,9 @@ warnings.filterwarnings('ignore')
 import numpy as np
 from habitat.config.default_structured_configs import AgentConfig
 from habitat.tasks.nav.nav import NavigationEpisode
-from habitat_sim.gfx import LightInfo, LightPositionModel
+from habitat_sim.gfx import LightInfo, LightPositionModel # type: ignore
 from tqdm import trange
-import habitat_sim
+import habitat_sim # type: ignore
 
 import os
 import os.path as osp
