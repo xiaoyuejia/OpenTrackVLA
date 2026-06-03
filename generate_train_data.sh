@@ -49,7 +49,7 @@ OUTPUT_DIR="data/sample"
 SIM_DATA_DIR="sim_data/stt_traintest"
 INSTRUCTION="Follow the target person without collision."
 # 数据筛选参数 (新增)
-MIN_FOLLOWING_RATE=0.7
+MIN_FOLLOWING_RATE=0.5
 EXCLUDE_COLLISION=true
 MIN_TOTAL_STEPS=50
 

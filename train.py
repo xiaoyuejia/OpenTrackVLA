@@ -4,7 +4,7 @@
 from __future__ import annotations
 from dataclasses import dataclass
 from typing import List, Tuple, Optional, Dict, Any
-import os, json, math, argparse, time, csv
+import os, sys, json, math, argparse, time, csv
 from pathlib import Path
 from contextlib import nullcontext
 from PIL import Image, ImageDraw
@@ -18,6 +18,8 @@ import torch.distributed as dist
 
 from transformers import AutoTokenizer, AutoModel
 from cache_gridpool import VisionFeatureCacher, VisionCacheConfig, grid_pool_tokens, adapt_siglip_grid
+from tqdm import tqdm
+
 
 
 # ----------------------- utils -----------------------
@@ -28,7 +30,7 @@ os.environ.setdefault('TOKENIZERS_PARALLELISM', 'false')
 def set_seed(seed: int):
     import random
     random.seed(seed); np.random.seed(seed)
-    torch.manual_seed(seed); torch.cuda.manual_seed_all(seed)
+    torch.manual_seed(seed)
 
 
 def load_tokens_file(path: str) -> torch.Tensor:
@@ -126,6 +128,14 @@ def _cleanup_state_dict_keys(state_dict: Dict[str, Any]) -> Dict[str, Any]:
     if any(k.startswith("module.") for k in state_dict.keys()):
         state_dict = {k.replace("module.", "", 1): v for k, v in state_dict.items()}
     return state_dict
+
+
+def _format_duration(seconds: float) -> str:
+    seconds = max(0, int(seconds))
+    h = seconds // 3600
+    m = (seconds % 3600) // 60
+    s = seconds % 60
+    return f"{h:02d}:{m:02d}:{s:02d}"
 
 # ----------------------- Sanity checks -----------------------
 
@@ -280,9 +290,16 @@ class OpenTrackVLA(nn.Module):
     def __init__(self, cfg: ModelConfig, vision_feat_dim: int):
         super().__init__()
         self.cfg = cfg
-        self.llm = AutoModel.from_pretrained(cfg.llm_name, torch_dtype=torch.bfloat16 if torch.cuda.is_available() else None)
+        rank = int(os.environ.get("RANK", "0"))
+        t0 = time.time()
+        print(f"[MODEL][rank {rank}] loading LLM weights: {cfg.llm_name}", flush=True)
+        self.llm = AutoModel.from_pretrained(cfg.llm_name, dtype=torch.bfloat16 if torch.cuda.is_available() else None)
+        print(f"[MODEL][rank {rank}] LLM weights loaded in {time.time() - t0:.1f}s", flush=True)
         self.llm.requires_grad_(not cfg.freeze_llm)
+        t0 = time.time()
+        print(f"[MODEL][rank {rank}] loading tokenizer: {cfg.llm_name}", flush=True)
         self.tokenizer = AutoTokenizer.from_pretrained(cfg.llm_name)
+        print(f"[MODEL][rank {rank}] tokenizer loaded in {time.time() - t0:.1f}s", flush=True)
         self.D = self.llm.config.hidden_size
         self.proj = CrossModalityProjector(vision_feat_dim, self.D)
         # Always keep projector trainable regardless of LLM freeze
@@ -668,6 +685,7 @@ class TrainConfig:
     llm_name: str = "Qwen/Qwen3-0.6B"
     epochs: int = 1
     batch_size: int = 12
+    grad_accum_steps: int = 1
     lr: float = 3e-4
     weight_decay: float = 0.01
     grad_clip: float = 1.0
@@ -685,6 +703,7 @@ class TrainConfig:
     # logging
     log_every: int = 10
     csv_logging: bool = True
+    progress: bool = True
     # trajectory saving
     save_trajectories: bool = False
     traj_subdir: str = 'trajectories'
@@ -734,14 +753,15 @@ def collate_batch(batch: List[Dict[str, Any]]) -> Dict[str, Any]:
 
 
 def train(cfg: TrainConfig):
-    set_seed(cfg.seed)
     torch.backends.cudnn.benchmark = True
     # Distributed setup
-    is_cuda = torch.cuda.is_available()
-    use_ddp = bool(cfg.distributed) and is_cuda
+    use_ddp = bool(cfg.distributed)
     if use_ddp:
         local_rank = int(os.environ.get('LOCAL_RANK', '0'))
+        # Set the rank-local CUDA device before any CUDA availability query.
+        # Otherwise nonzero ranks can create a small stray context on cuda:0.
         torch.cuda.set_device(local_rank)
+        is_cuda = True
         device = torch.device('cuda', local_rank)
 
         dist.init_process_group(
@@ -754,11 +774,16 @@ def train(cfg: TrainConfig):
         world_size = dist.get_world_size()
 
     else:
+        is_cuda = torch.cuda.is_available()
         device = torch.device('cuda' if is_cuda else 'cpu')
         local_rank = 0
         rank = 0
         world_size = 1
+    set_seed(cfg.seed)
+    if is_cuda:
+        torch.cuda.manual_seed(cfg.seed)
 
+    print(f"[INIT][rank {rank}] world_size={world_size} device={device} | loading dataset {cfg.train_json}", flush=True)
     ds = JsonTrackingDataset(DataConfig(train_json=cfg.train_json, n_waypoints=cfg.n_waypoints, history=cfg.history, cache_root=cfg.cache_root))
     if rank == 0:
         _dataset_sanity_report(ds, cfg)
@@ -793,31 +818,33 @@ def train(cfg: TrainConfig):
         except Exception as _e:
             if rank == 0:
                 print(f"[auto_alpha_xy] skipped due to error: {_e}")
-    # Auto-detect vision_feat_dim from dataset if needed
-    if rank == 0:
-        try:
-            sample_item = ds[0]
-            detected_dim = None
-            if 'fine_tokens' in sample_item:
-                detected_dim = sample_item['fine_tokens'].shape[-1]
-            elif 'coarse_tokens' in sample_item:
-                detected_dim = sample_item['coarse_tokens'].shape[-1]
-            if detected_dim is not None and detected_dim != cfg.vision_feat_dim:
-                print(f"[AUTO_DIM] Detected vision_feat_dim={detected_dim} from dataset (config had {cfg.vision_feat_dim}), updating...")
-                cfg.vision_feat_dim = detected_dim
-        except Exception as e:
-            print(f"[AUTO_DIM] Failed to auto-detect vision_feat_dim: {e}, using config value {cfg.vision_feat_dim}")
-    
-    # Broadcast the updated vision_feat_dim to all ranks in DDP
-    if use_ddp:
-        vision_feat_dim_tensor = torch.tensor([cfg.vision_feat_dim], dtype=torch.int32, device=device)
-        dist.broadcast(vision_feat_dim_tensor, src=0)
-        cfg.vision_feat_dim = int(vision_feat_dim_tensor.item())
+    # Auto-detect vision_feat_dim on every rank. This avoids an early NCCL
+    # broadcast before both ranks have reached model construction.
+    try:
+        sample_item = ds[0]
+        detected_dim = None
+        if 'fine_tokens' in sample_item:
+            detected_dim = sample_item['fine_tokens'].shape[-1]
+        elif 'coarse_tokens' in sample_item:
+            detected_dim = sample_item['coarse_tokens'].shape[-1]
+        if detected_dim is not None and detected_dim != cfg.vision_feat_dim:
+            if rank == 0:
+                print(f"[AUTO_DIM] Detected vision_feat_dim={detected_dim} from dataset (config had {cfg.vision_feat_dim}), updating...", flush=True)
+            cfg.vision_feat_dim = detected_dim
+    except Exception as e:
+        if rank == 0:
+            print(f"[AUTO_DIM] Failed to auto-detect vision_feat_dim: {e}, using config value {cfg.vision_feat_dim}", flush=True)
 
     sampler = torch.utils.data.distributed.DistributedSampler(ds, num_replicas=world_size, rank=rank, shuffle=True) if use_ddp else None
     dl = DataLoader(ds, batch_size=cfg.batch_size, shuffle=(sampler is None), num_workers=cfg.num_workers,
                     pin_memory=True, collate_fn=collate_batch, sampler=sampler)
+    if rank == 0:
+        print(
+            f"[INIT] dataloader ready | samples={len(ds)} local_batches/epoch={len(dl)} batch_per_gpu={cfg.batch_size}",
+            flush=True,
+        )
 
+    print(f"[INIT][rank {rank}] loading model {cfg.llm_name}", flush=True)
     model = OpenTrackVLA(
         ModelConfig(
             llm_name=cfg.llm_name,
@@ -828,9 +855,29 @@ def train(cfg: TrainConfig):
             alpha_xy=cfg.alpha_xy,
         ),
         vision_feat_dim=cfg.vision_feat_dim,
-    ).to(device)
+    )
+    print(f"[INIT][rank {rank}] moving model to {device}", flush=True)
+    model = model.to(device)
+    print(f"[INIT][rank {rank}] model moved to {device}", flush=True)
     if use_ddp:
-        model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[local_rank], output_device=local_rank, find_unused_parameters=False)
+        print(f"[INIT][rank {rank}] wrapping model with DDP", flush=True)
+        ddp_kwargs = {
+            "device_ids": [local_rank],
+            "output_device": local_rank,
+            "find_unused_parameters": False,
+            "broadcast_buffers": False,
+        }
+        if os.environ.get("DDP_INIT_SYNC", "1") == "0":
+            try:
+                import inspect
+                if "init_sync" in inspect.signature(torch.nn.parallel.DistributedDataParallel).parameters:
+                    ddp_kwargs["init_sync"] = False
+                    print(f"[INIT][rank {rank}] DDP init_sync disabled", flush=True)
+            except Exception:
+                pass
+        model = torch.nn.parallel.DistributedDataParallel(model, **ddp_kwargs)
+        print(f"[INIT][rank {rank}] DDP ready", flush=True)
+    print(f"[INIT][rank {rank}] model ready; entering training loop", flush=True)
 
     # Log trainable vs frozen parameters (rank 0 only)
     if rank == 0:
@@ -857,6 +904,14 @@ def train(cfg: TrainConfig):
 
     optim = torch.optim.AdamW(filter(lambda p: p.requires_grad, model.parameters()),
                               lr=cfg.lr, weight_decay=cfg.weight_decay)
+    cfg.grad_accum_steps = max(1, int(cfg.grad_accum_steps))
+    if rank == 0:
+        eff_batch = cfg.batch_size * world_size * cfg.grad_accum_steps
+        print(
+            f"[TRAIN] batch_per_gpu={cfg.batch_size} world_size={world_size} "
+            f"grad_accum_steps={cfg.grad_accum_steps} effective_batch={eff_batch}",
+            flush=True,
+        )
     # Mixed precision configuration
     amp_enabled = cfg.mixed_precision and is_cuda
     amp_dtype = torch.bfloat16  # switch to torch.float16 if you want fp16
@@ -904,10 +959,27 @@ def train(cfg: TrainConfig):
     last_log_time = time.time()
     epoch_start_time = last_log_time
     for epoch in range(cfg.epochs):
+        epoch_start_time = time.time()
         model.train()
         if use_ddp and sampler is not None:
             sampler.set_epoch(epoch)
-        for batch in dl:
+        pbar = None
+        if rank == 0 and cfg.progress and tqdm is not None:
+            pbar = tqdm(
+                total=len(dl),
+                desc=f"epoch {epoch + 1}/{cfg.epochs}",
+                dynamic_ncols=True,
+                leave=True,
+                file=sys.stdout,
+                disable=False,
+            )
+        for step_in_epoch, batch in enumerate(dl, start=1):
+            do_optim_step = (step_in_epoch % cfg.grad_accum_steps == 0) or (step_in_epoch == len(dl))
+            sync_ctx = (
+                model.no_sync()
+                if use_ddp and hasattr(model, "no_sync") and not do_optim_step
+                else nullcontext()
+            )
             coarse_tokens = batch['coarse_tokens'].to(device)
             coarse_tidx   = batch['coarse_tidx'].to(device)
             fine_tokens   = batch['fine_tokens'].to(device)
@@ -918,37 +990,38 @@ def train(cfg: TrainConfig):
             valid_mask    = batch['valid_mask'].to(device)
             instr         = batch['instruction']
 
-            optim.zero_grad(set_to_none=True)
             amp_ctx = torch.autocast(device_type='cuda', dtype=amp_dtype, enabled=amp_enabled) if amp_enabled else nullcontext()
-            with amp_ctx:
-                tau_pred = model(
-                    coarse_tokens, coarse_tidx,
-                    fine_tokens, fine_tidx,
-                    instr,
-                    yaw_hist=yaw_hist if cfg.use_angle_tvi else None,
-                    yaw_curr=yaw_curr if cfg.use_angle_tvi else None
-                )
-                # Option A: compute loss in normalized space — divide XY by alpha, keep yaw unscaled
-                # Get alpha vector from model (shape: (1,1,D_action)) and clamp to avoid div-by-zero
-                model_inspect = model.module if isinstance(model, torch.nn.parallel.DistributedDataParallel) else model
-                alpha_vec = getattr(model_inspect, 'alpha_task', None)
-                if alpha_vec is None:
-                    # Fallback: no scaling information; compute loss in absolute space
-                    pred_norm = tau_pred
-                    gt_norm = gt_wp
-                else:
-                    # Normalize only XY dims (0,1); leave others (e.g., yaw) unscaled
-                    pred_norm = tau_pred
-                    gt_norm = gt_wp
-                    if pred_norm.size(-1) >= 2 and alpha_vec.size(-1) >= 2:
-                        ax = alpha_vec[..., 0:2].clamp_min(1e-6)
-                        pred_norm = pred_norm.clone()
-                        gt_norm = gt_norm.clone()
-                        pred_norm[..., 0:2] = pred_norm[..., 0:2] / ax
-                        gt_norm[..., 0:2] = gt_norm[..., 0:2] / ax
-                L_nav = mse_masked(pred_norm, gt_norm, valid_mask)
-                L_QA = tau_pred.new_tensor(0.0)
-                loss = cfg.beta_nav * L_nav + L_QA
+            with sync_ctx:
+                with amp_ctx:
+                    tau_pred = model(
+                        coarse_tokens, coarse_tidx,
+                        fine_tokens, fine_tidx,
+                        instr,
+                        yaw_hist=yaw_hist if cfg.use_angle_tvi else None,
+                        yaw_curr=yaw_curr if cfg.use_angle_tvi else None
+                    )
+                    # Option A: compute loss in normalized space — divide XY by alpha, keep yaw unscaled
+                    # Get alpha vector from model (shape: (1,1,D_action)) and clamp to avoid div-by-zero
+                    model_inspect = model.module if isinstance(model, torch.nn.parallel.DistributedDataParallel) else model
+                    alpha_vec = getattr(model_inspect, 'alpha_task', None)
+                    if alpha_vec is None:
+                        # Fallback: no scaling information; compute loss in absolute space
+                        pred_norm = tau_pred
+                        gt_norm = gt_wp
+                    else:
+                        # Normalize only XY dims (0,1); leave others (e.g., yaw) unscaled
+                        pred_norm = tau_pred
+                        gt_norm = gt_wp
+                        if pred_norm.size(-1) >= 2 and alpha_vec.size(-1) >= 2:
+                            ax = alpha_vec[..., 0:2].clamp_min(1e-6)
+                            pred_norm = pred_norm.clone()
+                            gt_norm = gt_norm.clone()
+                            pred_norm[..., 0:2] = pred_norm[..., 0:2] / ax
+                            gt_norm[..., 0:2] = gt_norm[..., 0:2] / ax
+                    L_nav = mse_masked(pred_norm, gt_norm, valid_mask)
+                    L_QA = tau_pred.new_tensor(0.0)
+                    loss = cfg.beta_nav * L_nav + L_QA
+                scaler.scale(loss / cfg.grad_accum_steps).backward()
             # Save trajectories per-step (rank 0)
             if rank == 0 and cfg.save_trajectories:
                 try:
@@ -973,13 +1046,18 @@ def train(cfg: TrainConfig):
                         )
                 except Exception:
                     pass
-            scaler.scale(loss).backward()
+            if pbar is not None:
+                pbar.update(1)
+            if not do_optim_step:
+                continue
+
             grad_norm_before = 0.0
             if cfg.grad_clip is not None:
                 scaler.unscale_(optim)
                 grad_norm_before = _compute_total_grad_norm([p for p in model.parameters() if getattr(p, 'grad', None) is not None])
                 nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip)
             scaler.step(optim); scaler.update()
+            optim.zero_grad(set_to_none=True)
 
             step += 1
             if rank == 0 and (step % cfg.log_every == 0):
@@ -1017,6 +1095,10 @@ def train(cfg: TrainConfig):
                 nav_val = float(L_nav.detach().item())
                 ema_loss = loss_val if ema_loss is None else (0.98 * ema_loss + 0.02 * loss_val)
                 ema_nav = nav_val if ema_nav is None else (0.98 * ema_nav + 0.02 * nav_val)
+                progress_pct = 100.0 * step_in_epoch / max(1, len(dl))
+                elapsed_epoch = now - epoch_start_time
+                sec_per_batch = elapsed_epoch / max(1, step_in_epoch)
+                eta_txt = _format_duration(sec_per_batch * max(0, len(dl) - step_in_epoch))
 
                 mem_alloc_mb = mem_peak_mb = 0.0
                 if torch.cuda.is_available():
@@ -1028,12 +1110,17 @@ def train(cfg: TrainConfig):
                     mem_peak_mb = torch.cuda.max_memory_allocated(device) / (1024**2)
 
                 msg_lines = [
+                    f"[PROGRESS] epoch {epoch + 1}/{cfg.epochs} batch {min(step_in_epoch, len(dl))}/{len(dl)} ({progress_pct:.1f}%) | global_step={step} | eta={eta_txt}",
                     f"epoch {epoch} step {step} | lr={lr:.2e} | loss={loss_val:.4f} (ema {ema_loss:.4f}) | L_nav={nav_val:.4f} (ema {ema_nav:.4f})",
                     f"  mask_cov={mask_cov:.3f} | grad_norm_preclip={grad_norm_before:.3f} | step_time={dt:.3f}s | throughput={B/dt:.2f} it/s",
                     f"  pred(mean={pred_mean:.3f}, std={pred_std:.3f}, absmax={pred_absmax:.3f}) | gt(mean={gt_mean:.3f}, std={gt_std:.3f})",
                     f"  mse_total={mse_total:.5f} | per_dim_mse={per_dim_mse} | mem_alloc={mem_alloc_mb:.1f}MB peak={mem_peak_mb:.1f}MB"
                 ]
-                print("\n".join(msg_lines), flush=True)
+                if pbar is not None:
+                    pbar.set_postfix(loss=f"{loss_val:.4f}", nav=f"{nav_val:.4f}", s=f"{dt:.2f}")
+                    pbar.write("\n".join(msg_lines))
+                else:
+                    print("\n".join(msg_lines), flush=True)
 
                 # Debug preview: print GT and Pred waypoints (absolute), and normalized XY if alpha is set
                 """
@@ -1292,6 +1379,9 @@ def train(cfg: TrainConfig):
                 finally:
                     model.train()
 
+        if pbar is not None:
+            pbar.close()
+
     # Optional inference after training when requested (rank 0 only)
     if rank == 0 and cfg.infer_json:
         try:
@@ -1470,6 +1560,7 @@ def parse_args() -> TrainConfig:
     ap.add_argument('--history', type=int, default=31)
     ap.add_argument('--epochs', type=int, default=1)
     ap.add_argument('--batch_size', type=int, default=2)
+    ap.add_argument('--grad_accum_steps', type=int, default=1, help='Accumulate this many micro-batches before each optimizer step')
     ap.add_argument('--lr', type=float, default=2e-5)
     ap.add_argument('--weight_decay', type=float, default=0.01)
     ap.add_argument('--grad_clip', type=float, default=1.0)
@@ -1486,6 +1577,7 @@ def parse_args() -> TrainConfig:
     # logging / saving
     ap.add_argument('--log_every', type=int, default=10)
     ap.add_argument('--csv_logging', action='store_true')
+    ap.add_argument('--progress', action=argparse.BooleanOptionalAction, default=True, help='Show a tqdm progress bar on rank 0')
     ap.add_argument('--save_trajectories', action='store_true')
     ap.add_argument('--traj_subdir', type=str, default='trajectories')
     ap.add_argument('--vis_every', type=int, default=500, help='Save visualization every N steps (0 = disabled)')

@@ -223,7 +223,8 @@ class VisionCacheConfig:
     siglip_model_name: str = "google/siglip-so400m-patch14-384"
     image_size: int = 384          # enforce 384 for both towers
     batch_size: int = 24
-    device: str = "cuda" if torch.cuda.is_available() else "cpu"
+    # Keep this import-time default CUDA-free. Call sites that need GPU pass it explicitly.
+    device: str = "cuda"
     dtype: torch.dtype = torch.float16  # for storage; compute still in fp32
     force_square_resize: bool = True    # ensure exact 384x384
     use_modelscope: bool = None  # Will be set from env or default to True
@@ -575,4 +576,3 @@ if __name__ == "__main__":
             projector = CrossModalityProjector(in_dim=Vfine.shape[-1], out_dim=256)
             EVfine = projector(Vfine.float())  # (V, 64, 256)
             print("Projected tokens shape:", tuple(EVfine.shape))
-

@@ -3,6 +3,9 @@ data/humanoids
 data/sample
 data/scene_datasets
 data
+vicuna-7b-v1.5
+weights
+Qwen
 
 ckpt_qwen5
 __pycache__/

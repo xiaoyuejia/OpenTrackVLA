@@ -41,7 +41,7 @@ def calculate_metrics(save_path):
 if __name__ == "__main__":
     import argparse
     parser = argparse.ArgumentParser()
-    parser.add_argument("--save-path", type=str, default="sim_data/eval/my_stt_ckpt", help="Path to the evaluation results")
+    parser.add_argument("--save-path", type=str, default="sim_data/eval/stt_train", help="Path to the evaluation results")
     args = parser.parse_args()
     calculate_metrics(args.save_path)
     #修改目录用于结果--save-path sim_data/eval/dt  --save-path sim_data/eval/at

@@ -366,17 +366,34 @@ class GTBBoxAgent(AgentConfig):
                 print(f"[planner] Failed to load HF checkpoint ({exc}), falling back to legacy ckpt.")
         if PlannerModel is None or PlannerConfig is None:
             return
-        cfg = PlannerConfig()
-        cfg.n_waypoints = 8
-        model = PlannerModel(cfg, vision_feat_dim=vision_feat_dim).to(self.planner_device).eval()
-        print (self._planner_ckpt_path)
+        ckpt_config = {}
+        obj = None
         if self._planner_ckpt_path:
-            obj = torch.load(self._planner_ckpt_path, map_location=self.planner_device)
+            # Keep the checkpoint blob on CPU. Loading the full 3GB+ training
+            # checkpoint directly onto CUDA creates a large transient memory
+            # spike before the model state is copied into the module.
+            obj = torch.load(self._planner_ckpt_path, map_location='cpu')
+            ckpt_config = obj.get('config', {}) if isinstance(obj, dict) else {}
+
+        cfg = PlannerConfig()
+        cfg.llm_name = str(ckpt_config.get('llm_name', getattr(cfg, 'llm_name', "Qwen/Qwen3-0.6B")))
+        cfg.n_waypoints = int(ckpt_config.get('n_waypoints', getattr(cfg, 'n_waypoints', 8)))
+        cfg.beta_nav = float(ckpt_config.get('beta_nav', getattr(cfg, 'beta_nav', 10.0)))
+        cfg.use_angle_tvi = bool(ckpt_config.get('use_angle_tvi', getattr(cfg, 'use_angle_tvi', False)))
+        cfg.use_tanh_actions = not bool(ckpt_config.get('no_tanh_actions', not getattr(cfg, 'use_tanh_actions', True)))
+        cfg.alpha_xy = ckpt_config.get('alpha_xy', getattr(cfg, 'alpha_xy', None))
+        vision_feat_dim = int(ckpt_config.get('vision_feat_dim', vision_feat_dim))
+
+        print(f"[planner] legacy ckpt: {self._planner_ckpt_path}")
+        print(f"[planner] config n_waypoints={cfg.n_waypoints} vision_feat_dim={vision_feat_dim} alpha_xy={cfg.alpha_xy} beta_nav={cfg.beta_nav}")
+        model = PlannerModel(cfg, vision_feat_dim=vision_feat_dim).to(self.planner_device).eval()
+        if self._planner_ckpt_path:
             msd = obj.get('model_state') or obj.get('model_state_dict')
             if msd:
+                if any(k.startswith("module.") for k in msd.keys()):
+                    msd = {k.replace("module.", "", 1): v for k, v in msd.items()}
                 model.load_state_dict(msd, strict=False)
-                print (model)
-                print ("Planner model loaded successfully")
+                print("Planner model loaded successfully")
         self.planner_model = model
 
 

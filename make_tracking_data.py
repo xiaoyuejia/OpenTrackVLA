@@ -207,6 +207,7 @@ def collect_episode_pairs(input_root: Path) -> List[EpisodePaths]:
 
 def should_keep_episode(run_dir: Path, stem: str, only_success: bool,
                         min_following_rate: float = 0.0,
+                        min_total_steps: int = 0,
                         exclude_collision: bool = False) -> bool:
     """
     判断是否保留该 episode
@@ -216,6 +217,7 @@ def should_keep_episode(run_dir: Path, stem: str, only_success: bool,
         stem: episode 文件名前缀
         only_success: 是否只保留成功的 episode
         min_following_rate: 最小跟踪率阈值 (0-1)
+        min_total_steps: 最小 episode 步数
         exclude_collision: 是否排除碰撞的 episode
 
     Returns:
@@ -241,6 +243,12 @@ def should_keep_episode(run_dir: Path, stem: str, only_success: bool,
     following_rate = status.get("following_rate", 0)
     if isinstance(following_rate, (int, float)) and following_rate < min_following_rate:
         return False
+
+    # 检查 episode 长度
+    total_step = status.get("total_step", 0)
+    if min_total_steps > 0:
+        if not isinstance(total_step, (int, float)) or int(total_step) < min_total_steps:
+            return False
 
     # 如果不需要只保留成功的，到这里就通过了
     if not only_success:
@@ -283,6 +291,12 @@ def main():
         "--exclude_collision",
         action="store_true",
         help="Exclude episodes with collision. Recommended for high-quality training data.",
+    )
+    parser.add_argument(
+        "--min_total_steps",
+        type=int,
+        default=0,
+        help="Minimum episode length. Episodes with status total_step below this are excluded.",
     )
     parser.add_argument(
         "--instruction",
@@ -332,6 +346,7 @@ def main():
         kept += 1
         if not should_keep_episode(ep.run_dir, ep.stem, args.only_success,
                                    min_following_rate=args.min_following_rate,
+                                   min_total_steps=args.min_total_steps,
                                    exclude_collision=args.exclude_collision):
             continue
 
@@ -458,4 +473,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
