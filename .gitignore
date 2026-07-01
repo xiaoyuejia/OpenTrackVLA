@@ -11,6 +11,7 @@ ckpt_qwen5
 __pycache__/
 *.pyc
 __pycache__
+.codegraph/
 trackvla_vis/
 
 outputs/

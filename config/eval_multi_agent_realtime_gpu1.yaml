@@ -1,0 +1,100 @@
+version: 1
+name: multi_agent_realtime_gpu1
+
+python_bin: /home/hdt/miniconda3/envs/omtracknew/bin/python
+pipeline: sh/run_multi_agent_eval.sh
+parallel: false
+comparison_dir: /data/hdt/ntv_data/sim_data/eval/realtime_multi_agent_gpu1
+
+# Realtime deployment-style evaluation. Unreal keeps advancing while model
+# inference runs, and the planner waypoint is selected from the measured
+# interval between consecutive observations.
+common_env:
+  EVAL_SCRIPT: eval_unrealzoo_multi_agent.py
+  SPLIT_ROOT: /data/hdt/ntv_data/sim_data/New_paths_training_multi_agent_split_10to1
+  TEST_TARGET_MANIFEST: /data/hdt/ntv_data/sim_data/New_paths_training_multi_agent_split_10to1/split_manifest.json
+  EVAL_SCENES: ""
+  EVAL_EPISODES: manifest
+  EVAL_SEED: 100
+  EVAL_MAX_STEPS: 600
+  EVAL_MAX_LOST_STEPS: 20
+  EVAL_MAX_FAILURE_STEPS: 0
+  EVAL_FAILURE_WARMUP_STEPS: 20
+  EVAL_MAX_EPISODE_SECONDS: 0
+  EVAL_MIN_SUCCESS_STEPS: 20
+
+  EVAL_TARGET_REPLAY_MODE: path_goal
+  EVAL_TARGET_PATH_MIN_SPACING: 100
+  EVAL_TARGET_PATH_REACH_DISTANCE: 120
+  EVAL_TARGET_GOAL_REACH_DISTANCE: 50
+  EVAL_TARGET_STOP_WAIT_MIN_STEPS: 5
+  EVAL_TARGET_STOP_WAIT_MAX_STEPS: 15
+  EVAL_INIT_FROM_RECORDED_AGENT_POSES: 1
+  EVAL_HUMAN_SPEED: 90
+
+  EVAL_DT: 0.1
+  EVAL_HISTORY_FRAME_DT: 0.1
+  EVAL_DETERMINISTIC_STEP: 0
+  EVAL_REALTIME_WAYPOINT_TIMING: 1
+  EVAL_REALTIME_WAYPOINT_MIN_SECONDS: 0.1
+  EVAL_REALTIME_WAYPOINT_MAX_SECONDS: 0.9
+  EVAL_WAYPOINT_INDEX: 9
+  EVAL_DRONE_WAYPOINT_INDEX: 9
+  EVAL_ROBOTDOG_WAYPOINT_INDEX: 9
+  EVAL_WAYPOINT_HORIZON_STEPS: 9
+
+  EVAL_BBOX_SOURCE: none
+  EVAL_REQUIRE_VISUAL_TARGET: 0
+  EVAL_REQUIRE_CENTERED_TARGET: 0
+  EVAL_USE_MASK_VISIBILITY: 1
+  EVAL_MIN_VISIBLE_RATIO: 0.001
+
+  EVAL_DRONE_MIN_FOLLOW_DIST: 2.5
+  EVAL_DRONE_IDEAL_FOLLOW_DIST: 4.5
+  EVAL_DRONE_MAX_FOLLOW_DIST: 6.5
+  EVAL_DRONE_SUCCESS_DISTANCE: 6.5
+  EVAL_DRONE_LOST_DISTANCE: 8.0
+  EVAL_DRONE_VX_SCALE: 0.12
+  EVAL_DRONE_VY_SCALE: 0.1
+  EVAL_DRONE_YAW_SIGN: 1.0
+  EVAL_DRONE_YAW_SCALE: 3.0
+  EVAL_DRONE_MAX_SPEED: 0.12
+  EVAL_DRONE_MAX_VX: 0.12
+  EVAL_DRONE_MAX_VY: 0.05
+  EVAL_DRONE_MAX_YAW_RATE: 1.0
+
+  EVAL_ROBOTDOG_MIN_FOLLOW_DIST: 4.5
+  EVAL_ROBOTDOG_IDEAL_FOLLOW_DIST: 6.25
+  EVAL_ROBOTDOG_MAX_FOLLOW_DIST: 8.0
+  EVAL_ROBOTDOG_SUCCESS_DISTANCE: 8.0
+  EVAL_ROBOTDOG_LOST_DISTANCE: 10.0
+  EVAL_ROBOTDOG_YAW_SIGN: 1.0
+  EVAL_ROBOTDOG_SPEED_GAIN: 1.15
+  EVAL_ROBOTDOG_MAX_SPEED: 1.05
+  EVAL_ROBOTDOG_MAX_TURN_DEG: 30.0
+  EVAL_ROBOTDOG_MAX_LATERAL_SPEED: 0.45
+  EVAL_ROBOTDOG_MAX_YAW_RATE: 1.0
+
+  EVAL_OFFSCREEN: 1
+  EVAL_DISABLE_UE_INPUT: 1
+  EVAL_TIME_DILATION: -1
+  SAVE_EVAL_VIDEO: 1
+  EVAL_WRITE_GLOBAL_VIDEO: 0
+  EVAL_TRAJECTORY_OVERLAY: 1
+  EVAL_PLANNER_DEBUG_STEPS: 10
+
+# To evaluate another model, normally only change checkpoint, eval_root and
+# the three instruction fields below. Model architecture is detected from ckpt.
+models:
+  - name: separate
+    checkpoint: /data/hdt/ntv_data/ckpt/data_multi_agent_model_py_separate_base_marker_b32_acc4_lr2e-5_gpu7
+    eval_root: /data/hdt/ntv_data/sim_data/eval/realtime_multi_agent_gpu1/separate
+    gpu: 1
+    render_gpu: 1
+    env:
+      # Exact instruction setup stored in this checkpoint's train_config.json.
+      # Empty per-agent overrides activate the same built-in role text used in training.
+      EVAL_INSTRUCTION: The aerial drone and the ground robot dog must cooperatively track the same target person. The drone should follow the person from the air, and the robot dog should follow the same person on the ground.
+      EVAL_JOINT_INSTRUCTION: The aerial drone and the ground robot dog must cooperatively track the same target person. The drone should follow the person from the air, and the robot dog should follow the same person on the ground.
+      EVAL_AGENT1_INSTRUCTION: ""
+      EVAL_AGENT2_INSTRUCTION: ""

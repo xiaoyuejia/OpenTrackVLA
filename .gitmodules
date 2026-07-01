@@ -1,0 +1,4 @@
+[submodule "unrealzoo-gym"]
+	path = unrealzoo-gym
+	url = https://github.com/xiaoyuejia/OpenTrackVLA
+	branch = v3.0

@@ -1231,7 +1231,7 @@ class DiscreteStopActionConfig(ActionConfig):
     value: int = 1
     allow_dyn_slide: bool = False # True
     leg_animation_checkpoint: str = (
-        "data/robots/spot_data/spot_walking_trajectory.csv"
+        "/data/hdt/ntv_data/data/robots/spot_data/spot_walking_trajectory.csv"
     )
     play_i_perframe: int = 5
     use_range: Optional[List[int]] = field(default_factory=lambda: [107, 863])
@@ -1245,7 +1245,7 @@ class DiscreteMoveForwardActionConfig(ActionConfig):
     value: int = 1
     allow_dyn_slide: bool = False # True
     leg_animation_checkpoint: str = (
-        "data/robots/spot_data/spot_walking_trajectory.csv"
+        "/data/hdt/ntv_data/data/robots/spot_data/spot_walking_trajectory.csv"
     )
     play_i_perframe: int = 5
     use_range: Optional[List[int]] = field(default_factory=lambda: [107, 863])
@@ -1259,7 +1259,7 @@ class DiscreteTurnLeftActionConfig(ActionConfig):
     value: int = 1
     allow_dyn_slide: bool = False # True
     leg_animation_checkpoint: str = (
-        "data/robots/spot_data/spot_walking_trajectory.csv"
+        "/data/hdt/ntv_data/data/robots/spot_data/spot_walking_trajectory.csv"
     )
     play_i_perframe: int = 5
     use_range: Optional[List[int]] = field(default_factory=lambda: [107, 863])
@@ -1273,7 +1273,7 @@ class DiscreteTurnRightActionConfig(ActionConfig):
     value: int = 1
     allow_dyn_slide: bool = False # True
     leg_animation_checkpoint: str = (
-        "data/robots/spot_data/spot_walking_trajectory.csv"
+        "/data/hdt/ntv_data/data/robots/spot_data/spot_walking_trajectory.csv"
     )
     play_i_perframe: int = 5
     use_range: Optional[List[int]] = field(default_factory=lambda: [107, 863])

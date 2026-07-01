@@ -1,28 +1,28 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-"""OpenTrackVLA 原始单 Agent与 UnrealZoo 双 Agent MLP 模型定义。
+"""UnrealZoo 双 Agent Anchor Diffusion 模型定义。
 
 整体功能：
-- 将历史粗粒度视觉 token、当前细粒度视觉 token、目标 bbox 和文本指令送入 LLM。
-- 从 ACT 查询 token 回归局部未来路点，并从 GND 查询 token 预测目标框与可见性。
-- 同时保留 Habitat 单 Agent模型和 UnrealZoo 双 Agent MLP 规划模型。
+- 复用 OpenTrackVLA 的视觉、文本、TVI 和 grounding 编码链路。
+- 对 K-means 得到的预定义轨迹锚点加噪，再用条件 DiT 和 DDIM 两步去噪。
+- 为无人机与机器狗分别生成多条候选轨迹、候选分数和最终选中路点。
 
 核心类：
-- ``OpenTrackVLA``：Habitat 原始单 Agent模型，输出 ``waypoints/refined_bbox/visible_logits``。
-- ``MultiAgentOpenTrackVLA``：双 Agent共享 LLM、独立 MLP 规划头，输出两个 Agent 的路点。
-- ``MultiAgentSeparateOpenTrackVLA``：双 Agent独立 LLM 上下文对照，不拼接两个 Agent 的视觉 pieces。
-- ``TVIEmbedder`` / ``MultiAgentTVIEmbedder``：注入时间、视角、token 类别和 Agent 身份。
-- ``PlannerHead3L`` / ``GroundingHead``：分别执行路点回归和目标检测/可见性预测。
-- ``JsonTrackingDataset``：单 Agent模型独立推理时使用的数据读取器。
+- ``AnchorDiffusionActionModel``：单个 Agent 的锚点加噪、DiT 去噪、候选评分与选轨。
+- ``AnchorDiTBlock`` / ``SinusoidalTimestepEmbedding``：扩散 Transformer 与时间步编码。
+- ``MultiAgentOpenTrackVLA``：共享场景编码，调用两个独立 Anchor Diffusion 动作头。
+- ``GroundingHead``：从两个 Agent-specific GND state 分别预测 bbox 和可见性。
 
 关键函数：
-- ``integrate_actions_to_waypoints``：将速度动作积分为局部轨迹标签。
-- ``collate_batch``：组装单 Agent batch。
-- ``_run_inference`` / ``parse_args``：本文件独立推理入口。
+- ``fit_trajectory_anchors_kmeans`` / ``save_trajectory_anchors``：聚类并保存轨迹锚点。
+- ``anchor_diffusion_tracking_loss``：最近锚轨迹回归损失与候选评分 BCE。
+- ``_load_trajectory_anchors``：加载锚点文件或创建兜底锚点。
+- ``_run_inference`` / ``parse_args``：扩散模型独立推理入口。
 
-版本边界：
-- 双 Agent普通 MLP 训练使用 ``train.py --multi_agent``。
-- Anchor Diffusion 版本位于 ``model_unrealzoo_anchor_diffusion.py``。
+主要输出：
+``waypoints``、``candidate_trajectories``、``candidate_scores``、
+``refined_bbox``、``visible_logits``；训练时额外返回 ``action_loss``。
+
+训练入口为 ``train_unrealzoo_anchor_diffusion.py``，闭环评估入口为
+``eval_unrealzoo_multi_agent.py``。
 """
 
 from __future__ import annotations
@@ -39,6 +39,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 
+from diffusers.schedulers import DDIMScheduler
 from transformers import AutoTokenizer, AutoModel
 from tools.cache_gridpool import VisionFeatureCacher, VisionCacheConfig, grid_pool_tokens, adapt_siglip_grid
 
@@ -55,7 +56,7 @@ os.environ.setdefault('TOKENIZERS_PARALLELISM', 'false')
 # - CURRENT: 当前帧细粒度视觉 token，用于定位当前目标。
 # - BBOX: 当前目标框 token，把检测/跟踪先验注入 LLM。
 # - ACT: 每个 Agent 的动作查询 token，LLM 在这个位置输出规划隐藏状态。
-# - GND: grounding 查询 token，LLM 在这个位置输出 bbox/visibility 辅助隐藏状态。
+# - GND: 每个 Agent 各有一个 grounding 查询 token，输出对应坐标系的 bbox/visibility 状态。
 KIND_HISTORY = 0
 KIND_CURRENT = 1
 KIND_BBOX = 2
@@ -178,7 +179,7 @@ class TVIEmbedder(nn.Module):
         emb = emb + self.view_emb.weight[view_id] + self.kind_emb.weight[kind_id]
         return emb.squeeze(0)
 
-# 功能：跨模态投影器，将视觉token投影到与LLM相同的维度空间
+# 功能：跨模态投影器，将视觉token投影到与LLM相同的维度空间  
 class CrossModalityProjector(nn.Module):
     def __init__(self, in_dim: int, out_dim: int):
         super().__init__()
@@ -211,6 +212,459 @@ class PlannerHead3L(nn.Module):
         return y.view(-1, self.nw, self.ad)
 
 
+# ----------------------- 轨迹锚点生成与加载 -----------------------
+#
+# 本节迁移自 DiffusionDrive 的 truncated anchor diffusion 思路，并按 TrackVLA
+# 论文配置改造为：轨迹 K-means 锚点 + 锚点附近加噪 + DiT 去噪 + 两步 DDIM
+# + 多模态分数预测。DDIM 调度直接使用 DiffusionDrive 同款 diffusers 实现。
+
+def fit_trajectory_anchors_kmeans(
+    trajectories: np.ndarray,
+    num_anchors: int,
+    valid_mask: Optional[np.ndarray] = None,
+    num_iters: int = 100,
+    seed: int = 0,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """不依赖 scikit-learn，对固定长度轨迹执行 K-means 聚类。
+
+    Args:
+        trajectories: (S, Nw, D) trajectories in the same local frame and units
+            used by the model.
+        num_anchors: Number of trajectory modes M.
+        valid_mask: Optional (S, Nw) mask for partial horizons.
+        num_iters: Maximum K-means iterations.
+        seed: Deterministic initialization seed.
+
+    Returns:
+        anchors: (M, Nw, D) cluster centers.
+        assignment: (S,) nearest anchor index for every sample.
+    """
+    traj = np.asarray(trajectories, dtype=np.float32)
+    if traj.ndim != 3:
+        raise ValueError(f"trajectories must have shape (S,Nw,D), got {traj.shape}")
+    if traj.shape[0] < num_anchors:
+        raise ValueError(f"Need at least {num_anchors} trajectories, got {traj.shape[0]}")
+    mask = np.ones(traj.shape[:2], dtype=np.float32) if valid_mask is None else np.asarray(valid_mask, dtype=np.float32)
+    if mask.shape != traj.shape[:2]:
+        raise ValueError(f"valid_mask must have shape {traj.shape[:2]}, got {mask.shape}")
+    mask = (mask > 0).astype(np.float32)
+    rng = np.random.default_rng(seed)
+
+    # 使用和最近锚分配完全相同的 masked trajectory distance 做 K-means++ 初始化，
+    # 避免 partial horizon 的 padding 影响聚类，也比纯随机初始化稳定。
+    centers = [traj[int(rng.integers(0, traj.shape[0]))].copy()]
+    for _ in range(1, num_anchors):
+        center_arr = np.stack(centers, axis=0)
+        diff = traj[:, None] - center_arr[None]
+        sq = np.sum(diff * diff, axis=-1)
+        dist = np.sum(sq * mask[:, None], axis=-1) / np.maximum(mask.sum(axis=-1, keepdims=True), 1.0)
+        nearest = dist.min(axis=1)
+        nearest_sum = float(nearest.sum())
+        if nearest_sum <= 1e-8:
+            centers.append(traj[int(rng.integers(0, traj.shape[0]))].copy())
+        else:
+            probs = nearest / nearest_sum
+            centers.append(traj[int(rng.choice(traj.shape[0], p=probs))].copy())
+    centers_arr = np.stack(centers, axis=0)
+    assignment = np.full((traj.shape[0],), -1, dtype=np.int64)
+
+    for _ in range(max(1, num_iters)):
+        diff = traj[:, None] - centers_arr[None]
+        sq = np.sum(diff * diff, axis=-1)
+        dist = np.sum(sq * mask[:, None], axis=-1) / np.maximum(mask.sum(axis=-1, keepdims=True), 1.0)
+        new_assignment = dist.argmin(axis=1)
+        if np.array_equal(new_assignment, assignment):
+            break
+        assignment = new_assignment
+        for anchor_idx in range(num_anchors):
+            members = assignment == anchor_idx
+            if not np.any(members):
+                centers_arr[anchor_idx] = traj[int(np.argmax(dist.min(axis=1)))]
+                continue
+            member_traj = traj[members]
+            member_mask = mask[members, :, None]
+            centers_arr[anchor_idx] = np.sum(member_traj * member_mask, axis=0) / np.maximum(
+                member_mask.sum(axis=0), 1.0
+            )
+    return centers_arr.astype(np.float32), assignment
+
+
+def save_trajectory_anchors(path: Union[str, Path], anchors: np.ndarray, metadata: Optional[Dict[str, Any]] = None) -> None:
+    """保存 K-means 轨迹锚点，并可在同目录写入描述坐标系/单位的 JSON 元数据。"""
+    output = Path(path)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    arr = np.asarray(anchors, dtype=np.float32)
+    np.save(output, arr)
+    if metadata is not None:
+        meta = dict(metadata)
+        meta.setdefault("num_anchors", int(arr.shape[0]))
+        meta.setdefault("num_waypoints", int(arr.shape[1]))
+        meta.setdefault("action_dims", int(arr.shape[2]))
+        output.with_suffix(".json").write_text(json.dumps(meta, indent=2), encoding="utf-8")
+
+
+def _load_trajectory_anchors(
+    path: Optional[str],
+    num_anchors: int,
+    num_waypoints: int,
+    action_dims: int,
+) -> torch.Tensor:
+    # 锚点必须来自与训练标签相同的数据分布、坐标系、单位和 waypoint 数量。
+    if not path:
+        raise ValueError(
+            "Anchor diffusion requires an anchor .npy/.pt file. "
+            "Set diffusion_anchor_path (single Agent) or the per-Agent anchor paths."
+        )
+    anchor_path = Path(path).expanduser()
+    if not anchor_path.is_file():
+        raise FileNotFoundError(f"Trajectory anchor file does not exist: {anchor_path}")
+    if anchor_path.suffix.lower() == ".npy":
+        anchors = torch.from_numpy(np.load(anchor_path)).float()
+    else:
+        obj = torch.load(anchor_path, map_location="cpu")
+        if isinstance(obj, dict):
+            obj = obj.get("anchors", obj.get("trajectory_anchors"))
+        anchors = torch.as_tensor(obj, dtype=torch.float32)
+    expected = (num_anchors, num_waypoints, action_dims)
+    if tuple(anchors.shape) != expected:
+        raise ValueError(f"Expected anchor shape {expected}, got {tuple(anchors.shape)} from {anchor_path}")
+    return anchors
+
+
+# ----------------------- 扩散时间编码与 DiT 组件 -----------------------
+
+class SinusoidalTimestepEmbedding(nn.Module):
+    """把离散扩散 timestep 编码为正余弦向量，供 DiT 条件调制使用。"""
+
+    def __init__(self, dim: int):
+        super().__init__()
+        self.dim = dim
+
+    def forward(self, timestep: torch.Tensor) -> torch.Tensor:
+        timestep = timestep.float().view(-1)
+        half = self.dim // 2
+        frequency = torch.exp(
+            -math.log(10000.0) * torch.arange(half, device=timestep.device, dtype=torch.float32) / max(half - 1, 1)
+        )
+        angles = timestep[:, None] * frequency[None]
+        embedding = torch.cat([angles.sin(), angles.cos()], dim=-1)
+        if embedding.size(-1) < self.dim:
+            embedding = F.pad(embedding, (0, self.dim - embedding.size(-1)))
+        return embedding
+
+
+class TruncatedDDIMScheduler:
+    """基于 diffusers.DDIMScheduler 的锚点附近截断扩散调度器。
+
+    对应论文与 DiffusionDrive 的 ``prediction_type="sample"``：模型直接预测
+    去噪后的 x0，而不是噪声 epsilon。推理默认从 t=10 开始，只反推两步。
+    """
+
+    def __init__(
+        self,
+        num_train_timesteps: int = 1000,
+    ):
+        self.num_train_timesteps = int(num_train_timesteps)
+        # 与 DiffusionDrive 保持一致：scaled_linear beta，模型直接预测 x0/sample。
+        # clip_sample=False，避免当前轨迹归一化尺度被 diffusers 再次硬裁剪。
+        self.scheduler = DDIMScheduler(
+            num_train_timesteps=self.num_train_timesteps,
+            beta_schedule="scaled_linear",
+            prediction_type="sample",
+            clip_sample=False,
+        )
+
+    def add_noise(self, x0: torch.Tensor, noise: torch.Tensor, timestep: torch.Tensor) -> torch.Tensor:
+        """前向扩散 q(x_t|x_0)，给每条预定义锚点加入少量高斯噪声。"""
+        return self.scheduler.add_noise(original_samples=x0, noise=noise, timesteps=timestep.long())
+
+    def step(self, pred_x0: torch.Tensor, sample: torch.Tensor, timestep: int, next_timestep: int) -> torch.Tensor:
+        """使用 diffusers 的确定性 DDIM 更新，由当前 x_t 和预测 x0 得到下一步。"""
+        if next_timestep < 0:
+            return pred_x0
+        stride = max(1, int(timestep) - int(next_timestep))
+        self.scheduler.num_inference_steps = max(1, self.num_train_timesteps // stride)
+        return self.scheduler.step(
+            model_output=pred_x0,
+            timestep=int(timestep),
+            sample=sample,
+            eta=0.0,
+        ).prev_sample
+
+    @staticmethod
+    def inference_timesteps(start_timestep: int, num_steps: int) -> List[int]:
+        if num_steps < 1:
+            raise ValueError("num_steps must be >= 1")
+        return np.linspace(int(start_timestep), 0, num_steps).round().astype(np.int64).tolist()
+
+
+class AnchorDiTBlock(nn.Module):
+    """使用 AdaLN 注入 LLM 动作状态与扩散时间条件的 DiT block。
+
+    当前模型没有 DiffusionDrive 的 BEV feature map，因此不迁移
+    GridSampleCrossBEVAttention；所有锚点/路点 token 通过 self-attention 交互，
+    LLM 的 ``h_act`` 与 timestep 则通过 AdaLN 调制每一层。
+    """
+
+    def __init__(self, hidden_dim: int, num_heads: int, mlp_ratio: float = 4.0, dropout: float = 0.0):
+        super().__init__()
+        self.norm_attn = nn.LayerNorm(hidden_dim, elementwise_affine=False, eps=1e-6)
+        self.norm_ffn = nn.LayerNorm(hidden_dim, elementwise_affine=False, eps=1e-6)
+        self.attn = nn.MultiheadAttention(hidden_dim, num_heads, dropout=dropout, batch_first=True)
+        ffn_dim = int(hidden_dim * mlp_ratio)
+        self.ffn = nn.Sequential(
+            nn.Linear(hidden_dim, ffn_dim),
+            nn.GELU(approximate="tanh"),
+            nn.Dropout(dropout),
+            nn.Linear(ffn_dim, hidden_dim),
+        )
+        self.modulation = nn.Sequential(nn.SiLU(), nn.Linear(hidden_dim, hidden_dim * 6))
+        nn.init.zeros_(self.modulation[-1].weight)
+        nn.init.zeros_(self.modulation[-1].bias)
+
+    @staticmethod
+    def _modulate(x: torch.Tensor, shift: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
+        return x * (1.0 + scale[:, None]) + shift[:, None]
+
+    def forward(self, tokens: torch.Tensor, condition: torch.Tensor) -> torch.Tensor:
+        shift_a, scale_a, gate_a, shift_f, scale_f, gate_f = self.modulation(condition).chunk(6, dim=-1)
+        q = self._modulate(self.norm_attn(tokens), shift_a, scale_a)
+        attn_out = self.attn(q, q, q, need_weights=False)[0]
+        tokens = tokens + gate_a[:, None] * attn_out
+        ffn_in = self._modulate(self.norm_ffn(tokens), shift_f, scale_f)
+        return tokens + gate_f[:, None] * self.ffn(ffn_in)
+
+
+# ----------------------- 扩散跟踪损失与动作模型 -----------------------
+
+def anchor_diffusion_tracking_loss(
+    candidate_trajectories: torch.Tensor,
+    candidate_logits: torch.Tensor,
+    anchors: torch.Tensor,
+    target: torch.Tensor,
+    valid_mask: Optional[torch.Tensor] = None,
+    score_loss_weight: float = 100.0,
+    score_loss_reduction: str = "mean",
+) -> Dict[str, torch.Tensor]:
+    """论文公式 (3)：最近锚候选做轨迹 MSE，所有候选做二分类 BCE。
+
+    ``valid_mask`` 会同时用于最近锚分配和回归损失，避免无效 padding 路点决定正锚。
+    theta 使用 wrapped angle error，防止 -pi/pi 边界产生虚假的大误差。
+    默认对 M 个候选 BCE 取均值后乘 λ，避免候选数量再次线性放大梯度；
+    ``score_loss_reduction="sum"`` 可恢复公式字面上的求和行为。
+    """
+    B, M, Nw, D = candidate_trajectories.shape
+    if target.shape != (B, Nw, D):
+        raise ValueError(f"target must have shape {(B, Nw, D)}, got {tuple(target.shape)}")
+    mask = torch.ones(B, Nw, device=target.device, dtype=target.dtype) if valid_mask is None else valid_mask.to(
+        device=target.device, dtype=target.dtype
+    )
+    mask = mask.clamp(0.0, 1.0)
+    anchor_xy_error = torch.linalg.vector_norm(target[:, None, :, :2] - anchors[None, :, :, :2], dim=-1)
+    anchor_distance = (anchor_xy_error * mask[:, None]).sum(dim=-1) / mask.sum(dim=-1, keepdim=True).clamp_min(1.0)
+    # 每个样本只将与 GT 最近的 anchor 标记为正模式，其余模式均为负。
+    nearest_anchor = anchor_distance.argmin(dim=-1)
+
+    gather_idx = nearest_anchor[:, None, None, None].expand(-1, 1, Nw, D)
+    positive_prediction = candidate_trajectories.gather(1, gather_idx).squeeze(1)
+    error = positive_prediction - target
+    if D >= 3:
+        wrapped_heading = torch.atan2(torch.sin(error[..., 2:3]), torch.cos(error[..., 2:3]))
+        error = torch.cat([error[..., :2], wrapped_heading, error[..., 3:]], dim=-1)
+    regression_loss = ((error.square().mean(dim=-1) * mask).sum(dim=-1) / mask.sum(dim=-1).clamp_min(1.0)).mean()
+
+    score_target = torch.zeros_like(candidate_logits)
+    score_target.scatter_(1, nearest_anchor[:, None], 1.0)
+    per_anchor_score_loss = F.binary_cross_entropy_with_logits(candidate_logits, score_target, reduction="none")
+    if score_loss_reduction == "mean":
+        # λ=100 已负责放大分类项；对候选取均值可避免 M=40 再额外放大梯度。
+        score_loss = per_anchor_score_loss.mean()
+    elif score_loss_reduction == "sum":
+        # 保留论文公式字面上的 sum_i BCE，便于消融和兼容旧实验。
+        score_loss = per_anchor_score_loss.sum(dim=-1).mean()
+    else:
+        raise ValueError(f"Unsupported score_loss_reduction={score_loss_reduction!r}; expected 'mean' or 'sum'.")
+    total = regression_loss + float(score_loss_weight) * score_loss
+    return {
+        "loss": total,
+        "regression_loss": regression_loss,
+        "score_loss": score_loss,
+        "nearest_anchor": nearest_anchor,
+        "anchor_distance": anchor_distance.detach(),
+    }
+
+
+class AnchorDiffusionActionModel(nn.Module):
+    """参考 TrackVLA 与 DiffusionDrive 实现的基于锚点的扩散动作头。
+
+    锚点与输出都使用当前项目原有的局部轨迹实际单位。内部先按 anchor bank
+    的量级归一化，再在锚点附近加噪并用截断 DDIM 去噪。最终选择分数最高的候选，
+    因而仍兼容原规划头 ``(B, Nw, D)`` 的 waypoint 输出接口。
+
+    主要张量：
+    - anchors / candidate_trajectories: (B, M, Nw, D)
+    - candidate_logits: (B, M)
+    - condition: (B, D_llm)，即 LLM 在 ACT token 位置的隐藏状态
+    """
+
+    def __init__(
+        self,
+        condition_dim: int,
+        anchors: torch.Tensor,
+        hidden_dim: int = 768,
+        depth: int = 12,
+        num_heads: int = 12,
+        mlp_ratio: float = 4.0,
+        dropout: float = 0.0,
+        num_train_timesteps: int = 1000,
+        train_truncation_steps: int = 50,
+        inference_start_timestep: int = 10,
+        inference_steps: int = 2,
+        score_loss_weight: float = 100.0,
+        score_loss_reduction: str = "mean",
+        deterministic_inference: bool = False,
+    ):
+        super().__init__()
+        if anchors.dim() != 3:
+            raise ValueError(f"anchors must have shape (M,Nw,D), got {tuple(anchors.shape)}")
+        self.num_anchors, self.num_waypoints, self.action_dims = [int(v) for v in anchors.shape]
+        self.hidden_dim = int(hidden_dim)
+        self.train_truncation_steps = int(train_truncation_steps)
+        self.inference_start_timestep = int(inference_start_timestep)
+        self.inference_steps = int(inference_steps)
+        self.score_loss_weight = float(score_loss_weight)
+        self.score_loss_reduction = str(score_loss_reduction)
+        self.deterministic_inference = bool(deterministic_inference)
+
+        # 使用 buffer 保存锚点，使其随 checkpoint 保存和迁移设备，但不参与梯度更新。
+        self.register_buffer("anchors", anchors.float(), persistent=True)
+        # 不照搬 DiffusionDrive 针对汽车轨迹的硬编码 norm_odo；这里从当前 anchor
+        # bank 自动得到每个动作维度的尺度，保证训练/推理使用同一归一化方式。
+        action_scale = anchors.abs().amax(dim=(0, 1)).clamp_min(1e-3)
+        self.register_buffer("action_scale", action_scale.view(1, 1, 1, -1), persistent=True)
+        self.scheduler = TruncatedDDIMScheduler(num_train_timesteps=num_train_timesteps)
+        self.condition_proj = nn.Sequential(nn.LayerNorm(condition_dim), nn.Linear(condition_dim, hidden_dim))
+        self.time_embed = nn.Sequential(
+            SinusoidalTimestepEmbedding(hidden_dim),
+            nn.Linear(hidden_dim, hidden_dim * 4),
+            nn.SiLU(),
+            nn.Linear(hidden_dim * 4, hidden_dim),
+        )
+        self.trajectory_embed = nn.Linear(self.action_dims, hidden_dim)
+        self.anchor_embed = nn.Embedding(self.num_anchors, hidden_dim)
+        self.waypoint_embed = nn.Embedding(self.num_waypoints, hidden_dim)
+        # 当前采用 base diffusion transformer 配置：12 层、768 隐藏维度、12 个注意力头。
+        self.blocks = nn.ModuleList(
+            [AnchorDiTBlock(hidden_dim, num_heads, mlp_ratio=mlp_ratio, dropout=dropout) for _ in range(depth)]
+        )
+        self.final_norm = nn.LayerNorm(hidden_dim)
+        self.trajectory_delta = nn.Linear(hidden_dim, self.action_dims)
+        self.score_head = nn.Sequential(nn.LayerNorm(hidden_dim), nn.Linear(hidden_dim, 1))
+        nn.init.zeros_(self.trajectory_delta.weight)
+        nn.init.zeros_(self.trajectory_delta.bias)
+        nn.init.zeros_(self.score_head[-1].weight)
+        nn.init.zeros_(self.score_head[-1].bias)
+
+    def _normalize(self, trajectory: torch.Tensor) -> torch.Tensor:
+        return trajectory / self.action_scale.to(device=trajectory.device, dtype=trajectory.dtype)
+
+    def _denormalize(self, trajectory: torch.Tensor) -> torch.Tensor:
+        return trajectory * self.action_scale.to(device=trajectory.device, dtype=trajectory.dtype)
+
+    def _decode(self, noisy_normalized: torch.Tensor, timestep: torch.Tensor, condition: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """一次 DiT 去噪预测，同时输出所有锚点模式的 x0 与分类分数。"""
+        B, M, Nw, _ = noisy_normalized.shape
+        tokens = self.trajectory_embed(noisy_normalized)
+        anchor_ids = torch.arange(M, device=tokens.device)
+        waypoint_ids = torch.arange(Nw, device=tokens.device)
+        tokens = tokens + self.anchor_embed(anchor_ids)[None, :, None] + self.waypoint_embed(waypoint_ids)[None, None]
+        # 将 M 条候选轨迹的 Nw 个路点展开为 token 序列，使不同模式也能互相注意。
+        tokens = tokens.reshape(B, M * Nw, self.hidden_dim)
+        cond = self.condition_proj(condition.float()) + self.time_embed(timestep)
+        for block in self.blocks:
+            tokens = block(tokens, cond)
+        tokens = self.final_norm(tokens).view(B, M, Nw, self.hidden_dim)
+        pred_x0 = noisy_normalized + self.trajectory_delta(tokens)
+        logits = self.score_head(tokens.mean(dim=2)).squeeze(-1)
+        return pred_x0, logits
+
+    @staticmethod
+    def _gather_top_candidate(candidates: torch.Tensor, logits: torch.Tensor) -> torch.Tensor:
+        B, _, Nw, D = candidates.shape
+        best = logits.argmax(dim=-1)
+        return candidates.gather(1, best[:, None, None, None].expand(-1, 1, Nw, D)).squeeze(1)
+
+    def forward(
+        self,
+        condition: torch.Tensor,
+        target: Optional[torch.Tensor] = None,
+        valid_mask: Optional[torch.Tensor] = None,
+        noise: Optional[torch.Tensor] = None,
+    ) -> Dict[str, torch.Tensor]:
+        B = condition.size(0)
+        anchors = self.anchors[None].expand(B, -1, -1, -1).to(device=condition.device, dtype=torch.float32)
+        anchors_normalized = self._normalize(anchors)
+        if self.training:
+            # 论文训练阶段只从总计 1000 步中的前 50 步采样，因此噪声始终靠近锚点。
+            timestep = torch.randint(
+                0,
+                min(self.train_truncation_steps, self.scheduler.num_train_timesteps),
+                (B,),
+                device=condition.device,
+            )
+            diffusion_noise = torch.randn_like(anchors_normalized) if noise is None else noise.to(anchors_normalized)
+            sample = self.scheduler.add_noise(anchors_normalized, diffusion_noise, timestep)
+            pred_x0, logits = self._decode(sample, timestep, condition)
+        else:
+            # 推理阶段从锚点的 t=10 加噪状态开始，默认只做两次 DDIM 去噪。
+            diffusion_noise = (
+                torch.zeros_like(anchors_normalized)
+                if self.deterministic_inference
+                else (torch.randn_like(anchors_normalized) if noise is None else noise.to(anchors_normalized))
+            )
+            start_t = min(self.inference_start_timestep, self.scheduler.num_train_timesteps - 1)
+            start = torch.full((B,), start_t, device=condition.device, dtype=torch.long)
+            sample = self.scheduler.add_noise(anchors_normalized, diffusion_noise, start)
+            timesteps = self.scheduler.inference_timesteps(start_t, self.inference_steps)
+            pred_x0 = sample
+            logits = torch.zeros(B, self.num_anchors, device=condition.device)
+            for idx, timestep_value in enumerate(timesteps):
+                timestep = torch.full((B,), int(timestep_value), device=condition.device, dtype=torch.long)
+                pred_x0, logits = self._decode(sample, timestep, condition)
+                next_timestep = timesteps[idx + 1] if idx + 1 < len(timesteps) else -1
+                sample = self.scheduler.step(pred_x0, sample, int(timestep_value), int(next_timestep))
+
+        candidates = self._denormalize(pred_x0)
+        if self.action_dims >= 3:
+            wrapped_heading = torch.atan2(
+                torch.sin(candidates[..., 2:3]),
+                torch.cos(candidates[..., 2:3]),
+            )
+            candidates = torch.cat([candidates[..., :2], wrapped_heading, candidates[..., 3:]], dim=-1)
+        # 论文推理规则：选取得分最高的候选轨迹作为最终动作输出。
+        trajectory = self._gather_top_candidate(candidates, logits)
+        output: Dict[str, torch.Tensor] = {
+            "trajectory": trajectory,
+            "candidate_trajectories": candidates,
+            "candidate_logits": logits,
+            "candidate_scores": logits.sigmoid(),
+            "anchors": anchors,
+        }
+        if target is not None:
+            output.update(
+                anchor_diffusion_tracking_loss(
+                    candidates,
+                    logits,
+                    anchors[0],
+                    target.to(device=candidates.device, dtype=candidates.dtype),
+                    valid_mask=valid_mask,
+                    score_loss_weight=self.score_loss_weight,
+                    score_loss_reduction=self.score_loss_reduction,
+                )
+            )
+        return output
+
+
 # ----------------------- 单 Agent模型配置与主干 -----------------------
 
 @dataclass
@@ -232,6 +686,23 @@ class ModelConfig:
     # Action/target configuration
     use_tanh_actions: bool = True
     alpha_xy: Optional[float] = None
+    # 可选的基于锚点扩散动作头。锚点必须使用当前项目的局部轨迹实际单位，
+    # shape 固定为 (M, n_waypoints, 3)。
+    use_anchor_diffusion: bool = False
+    diffusion_anchor_path: Optional[str] = None
+    diffusion_num_anchors: int = 40
+    diffusion_hidden_dim: int = 768
+    diffusion_depth: int = 12
+    diffusion_num_heads: int = 12
+    diffusion_mlp_ratio: float = 4.0
+    diffusion_dropout: float = 0.0
+    diffusion_num_train_timesteps: int = 1000
+    diffusion_train_truncation_steps: int = 50
+    diffusion_inference_start_timestep: int = 10
+    diffusion_inference_steps: int = 2
+    diffusion_score_loss_weight: float = 100.0
+    diffusion_score_loss_reduction: str = "mean"
+    diffusion_deterministic_inference: bool = False
 
 
 class OpenTrackVLA(nn.Module):
@@ -277,7 +748,33 @@ class OpenTrackVLA(nn.Module):
         nn.init.normal_(self.act_token, std=0.02)
         action_dims = 3
         self.action_dims = action_dims
-        self.planner = PlannerHead3L(self.D, cfg.n_waypoints, action_dims, use_tanh=cfg.use_tanh_actions)
+        if cfg.use_anchor_diffusion:
+            # 扩散规划头直接从 LLM 的 ACT hidden state 条件化生成多模态轨迹；
+            # 默认不开启，因此旧 checkpoint 和原 MLP 行为保持兼容。
+            anchors = _load_trajectory_anchors(
+                cfg.diffusion_anchor_path,
+                cfg.diffusion_num_anchors,
+                cfg.n_waypoints,
+                action_dims,
+            )
+            self.planner = AnchorDiffusionActionModel(
+                condition_dim=self.D,
+                anchors=anchors,
+                hidden_dim=cfg.diffusion_hidden_dim,
+                depth=cfg.diffusion_depth,
+                num_heads=cfg.diffusion_num_heads,
+                mlp_ratio=cfg.diffusion_mlp_ratio,
+                dropout=cfg.diffusion_dropout,
+                num_train_timesteps=cfg.diffusion_num_train_timesteps,
+                train_truncation_steps=cfg.diffusion_train_truncation_steps,
+                inference_start_timestep=cfg.diffusion_inference_start_timestep,
+                inference_steps=cfg.diffusion_inference_steps,
+                score_loss_weight=cfg.diffusion_score_loss_weight,
+                score_loss_reduction=cfg.diffusion_score_loss_reduction,
+                deterministic_inference=cfg.diffusion_deterministic_inference,
+            )
+        else:
+            self.planner = PlannerHead3L(self.D, cfg.n_waypoints, action_dims, use_tanh=cfg.use_tanh_actions)
         self.planner.requires_grad_(True)
         if not cfg.use_angle_tvi:
             for p in self.tvi.angle_proj.parameters():
@@ -350,7 +847,10 @@ class OpenTrackVLA(nn.Module):
                 instructions,
                 yaw_hist: Optional[torch.Tensor] = None,
                 yaw_curr: Optional[torch.Tensor] = None,
-                bbox_feat: Optional[torch.Tensor] = None):
+                bbox_feat: Optional[torch.Tensor] = None,
+                target_waypoints: Optional[torch.Tensor] = None,
+                valid_mask: Optional[torch.Tensor] = None,
+                return_action_details: bool = False):
         """单 Agent 前向传播。
 
         输入：
@@ -388,8 +888,15 @@ class OpenTrackVLA(nn.Module):
         out = self.llm(inputs_embeds=seq, attention_mask=attn, output_hidden_states=True, use_cache=False)
         h_act = out.last_hidden_state[:, -1, :]
         h_act = h_act.float()
+        if self.cfg.use_anchor_diffusion:
+            # target_waypoints/valid_mask 只在训练时传入，用于最近锚分配和公式 (3)
+            # 的 tracking loss；推理时返回 top-1 候选轨迹。
+            action_output = self.planner(h_act, target=target_waypoints, valid_mask=valid_mask)
+            return action_output if return_action_details else action_output["trajectory"]
         a_hat = self.planner(h_act)
         tau_pred = a_hat * self.alpha_task
+        if return_action_details:
+            return {"trajectory": tau_pred}
         return tau_pred
 
 
@@ -399,16 +906,10 @@ class OpenTrackVLA(nn.Module):
 class MultiAgentModelConfig:
     """双 Agent 模型配置。
 
-    这个配置同时服务两个变体：
-    - model.py-base: 只做双 Agent 视觉/文本融合和 waypoint 预测。
-    - model.py-full: 在 base 路径上额外打开 bbox token、GND token 和 grounding head。
-
     数据流相关字段：
     - num_agents 固定为 2：默认 agent1=无人机，agent2=机器狗。
     - max_views/num_kinds 控制 TVI/agent/type embedding 的词表大小。
     - insert_time_tokens=True 时，会在每一帧视觉 token 前插入时间 marker。
-    - use_agent_text_markers 只控制 shared base 中视觉流前的语言 marker；
-      关闭后仍保留逐视觉 token 的 agent/view/kind/time embedding。
     - bbox_delta_scale 控制 grounding head 对输入 bbox 的修正幅度。
     """
 
@@ -425,16 +926,26 @@ class MultiAgentModelConfig:
     use_tanh_actions: bool = True
     alpha_xy: Optional[float] = 2.0
     bbox_delta_scale: float = 0.25
-    use_grounding: bool = True
-    use_bbox_tokens: bool = True
     return_token_logits: bool = False
     text_max_length: int = 128
-    use_agent_text_markers: bool = True
-
-    @property
-    def is_base_variant(self) -> bool:
-        """True 表示当前配置是无 grounding 的 base 对照模型。"""
-        return not self.use_grounding and not self.use_bbox_tokens
+    # 双 Agent 使用独立 anchor bank，因为无人机和机器狗的动力学与轨迹分布不同。
+    use_anchor_diffusion: bool = False
+    diffusion_anchor_path: Optional[str] = None
+    diffusion_agent1_anchor_path: Optional[str] = None
+    diffusion_agent2_anchor_path: Optional[str] = None
+    diffusion_num_anchors: int = 40
+    diffusion_hidden_dim: int = 768
+    diffusion_depth: int = 12
+    diffusion_num_heads: int = 12
+    diffusion_mlp_ratio: float = 4.0
+    diffusion_dropout: float = 0.0
+    diffusion_num_train_timesteps: int = 1000
+    diffusion_train_truncation_steps: int = 50
+    diffusion_inference_start_timestep: int = 10
+    diffusion_inference_steps: int = 2
+    diffusion_score_loss_weight: float = 100.0
+    diffusion_score_loss_reduction: str = "mean"
+    diffusion_deterministic_inference: bool = False
 
 
 class MultiAgentTVIEmbedder(nn.Module):
@@ -506,7 +1017,7 @@ class MultiAgentTVIEmbedder(nn.Module):
     def make_marker(
         self,
         t_scalar: int,
-        kind_id: int,
+        kind_id: int,                           
         agent_id: int,
         view_id: int,
         device: torch.device,
@@ -567,47 +1078,26 @@ class MultiAgentTVIEmbedder(nn.Module):
 class GroundingHead(nn.Module):
     """逐 Agent 目标 grounding 辅助头。
 
+    每个 Agent 有自己的 GND hidden state，但两个 Agent 共享输出头参数。这样
+    GND 查询分别绑定各自坐标系，同时仍能从完整双视角 LLM 上下文读取信息。
+
     输入：
     - h_gnd: 两个 GND 查询 token 的隐藏状态，shape (B, 2, D)。
-    - bbox_feat: 原始 bbox 先验，shape (B, 2, 4)，可选。
+    - bbox_feat: bbox 先验，shape (B, 2, 4)，可选。
     - bbox_valid_mask: 每个 Agent 是否有可用 bbox 先验，shape (B, 2)。
-    - visual_tokens: 视觉 token 池，shape (B, 2, Nv, D)，用于 spatial cross-attention。
+    - visual_tokens: 可选视觉 token 池，用于 token-level 对齐打分。
 
     输出：
     - refined_bbox: 两个 Agent 各自坐标系下的 bbox，shape (B, 2, 4)。
-    - relative_pose: 每个 Agent 坐标系下的目标空间量，shape (B, 2, 5)，
-      格式 [dx_m, dy_m, dz_m, sin(d_yaw), cos(d_yaw)]。
-    - spatial_emb: GND token 融合视觉 token 后的空间 embedding，shape (B, 2, D)。
     - visible_logits/visible_score: 两个 Agent 视角下目标是否可见。
     - token_logits: 可选 token grounding 分数，便于后续做更细监督。
     """
 
-    def __init__(
-        self,
-        d_model: int,
-        num_agents: int = 2,
-        bbox_delta_scale: float = 0.25,
-        num_heads: int = 8,
-    ):
+    def __init__(self, d_model: int, num_agents: int = 2, bbox_delta_scale: float = 0.25):
         super().__init__()
         self.num_agents = num_agents
         self.bbox_delta_scale = bbox_delta_scale
-        while num_heads > 1 and d_model % num_heads != 0:
-            num_heads -= 1
         hid = d_model * 2
-        self.gnd_cross_norm = nn.LayerNorm(d_model)
-        self.visual_cross_norm = nn.LayerNorm(d_model)
-        self.spatial_cross_attn = nn.MultiheadAttention(
-            embed_dim=d_model,
-            num_heads=num_heads,
-            batch_first=True,
-        )
-        self.spatial_ffn = nn.Sequential(
-            nn.LayerNorm(d_model),
-            nn.Linear(d_model, hid),
-            nn.GELU(),
-            nn.Linear(hid, d_model),
-        )
         self.bbox_absolute = nn.Sequential(
             nn.LayerNorm(d_model),
             nn.Linear(d_model, hid),
@@ -626,12 +1116,6 @@ class GroundingHead(nn.Module):
             nn.GELU(),
             nn.Linear(hid, 1),
         )
-        self.relative_pose = nn.Sequential(
-            nn.LayerNorm(d_model),
-            nn.Linear(d_model, hid),
-            nn.GELU(),
-            nn.Linear(hid, 5),
-        )
         self.per_agent_token_query = nn.Sequential(
             nn.LayerNorm(d_model),
             nn.Linear(d_model, d_model),
@@ -644,33 +1128,20 @@ class GroundingHead(nn.Module):
         bbox_valid_mask: Optional[torch.Tensor] = None,
         visual_tokens: Optional[torch.Tensor] = None,
     ) -> Dict[str, Optional[torch.Tensor]]:
-        """根据两个 GND 隐藏状态分别预测 bbox、可见性和相对空间量。
+        """根据两个 GND 隐藏状态分别预测 bbox 和可见性。
 
         处理逻辑：
-        1. GND token 作为 query，从对应 Agent 的视觉 token 中 cross-attend 目标线索。
-        2. 有有效 bbox prior 的 Agent 使用 residual head 做有界修正。
-        3. prior 被丢弃或缺失的 Agent 使用 absolute head 从视觉直接检测。
-        4. visibility、relative_pose 和 token grounding 都由 spatial_emb 预测。
+        1. 有有效 bbox prior 的 Agent 使用 residual head 做有界修正。
+        2. prior 被丢弃或缺失的 Agent 使用 absolute head 从视觉直接检测。
+        3. visibility 和 token grounding 都由对应 Agent 的 GND state 预测。
         """
         if h_gnd.dim() != 3 or h_gnd.size(1) != self.num_agents:
-            raise ValueError(f"h_gnd must have shape (B, {self.num_agents}, D), got {tuple(h_gnd.shape)}")
+            raise ValueError(
+                f"h_gnd must have shape (B, {self.num_agents}, D), got {tuple(h_gnd.shape)}"
+            )
         B = h_gnd.size(0)
-        spatial_emb = h_gnd
-        if visual_tokens is not None:
-            if visual_tokens.dim() != 4 or visual_tokens.size(0) != B or visual_tokens.size(1) != self.num_agents:
-                raise ValueError(
-                    "visual_tokens must have shape "
-                    f"(B, {self.num_agents}, Nv, D), got {tuple(visual_tokens.shape)}"
-                )
-            q = self.gnd_cross_norm(h_gnd).reshape(B * self.num_agents, 1, -1)
-            kv = visual_tokens.to(device=h_gnd.device, dtype=h_gnd.dtype)
-            kv = self.visual_cross_norm(kv).reshape(B * self.num_agents, kv.size(2), kv.size(3))
-            attn_out, _ = self.spatial_cross_attn(q, kv, kv, need_weights=False)
-            spatial_emb = h_gnd + attn_out.reshape(B, self.num_agents, -1)
-        spatial_emb = spatial_emb + self.spatial_ffn(spatial_emb)
-
-        absolute_bbox = torch.sigmoid(self.bbox_absolute(spatial_emb))
-        delta = torch.tanh(self.bbox_residual(spatial_emb)) * self.bbox_delta_scale
+        absolute_bbox = torch.sigmoid(self.bbox_absolute(h_gnd))
+        delta = torch.tanh(self.bbox_residual(h_gnd)) * self.bbox_delta_scale
 
         if bbox_feat is None:
             bbox_prior = torch.zeros_like(absolute_bbox)
@@ -688,12 +1159,11 @@ class GroundingHead(nn.Module):
         residual_bbox = (bbox_prior + delta).clamp(0.0, 1.0)
         refined_bbox = torch.where(valid_prior.unsqueeze(-1), residual_bbox, absolute_bbox)
 
-        visible_logits = self.visibility(spatial_emb).squeeze(-1)
+        visible_logits = self.visibility(h_gnd).squeeze(-1)
         visible_score = torch.sigmoid(visible_logits)
-        relative_pose = self.relative_pose(spatial_emb)
         token_logits = None
         if visual_tokens is not None:
-            queries = self.per_agent_token_query(spatial_emb)
+            queries = self.per_agent_token_query(h_gnd)
             token_logits = torch.einsum("bad,band->ban", queries.float(), visual_tokens.float())
             token_logits = token_logits / math.sqrt(max(1, queries.size(-1)))
 
@@ -701,30 +1171,16 @@ class GroundingHead(nn.Module):
             "refined_bbox": refined_bbox,
             "absolute_bbox": absolute_bbox,
             "bbox_prior_mask": valid_prior,
-            "relative_pose": relative_pose,
-            "spatial_emb": spatial_emb,
             "visible_logits": visible_logits,
             "visible_score": visible_score,
             "token_logits": token_logits,
         }
 
 
-# ----------------------- 双 Agent模型主干 -----------------------
+# ----------------------- 双 Agent Anchor Diffusion 模型主干 -----------------------
 
 class MultiAgentOpenTrackVLA(nn.Module):
     """双 Agent OpenTrackVLA 主模型。
-
-    本类包含两个清晰变体，训练脚本通过 cfg 开关选择：
-
-    model.py-base:
-      默认：[任务文本, agent1文本marker, agent1视觉, agent2文本marker, agent2视觉, ACT1, ACT2]
-      无 marker：[任务文本, agent1视觉, agent2视觉, ACT1, ACT2]
-      -> planner_agent1/2 -> waypoints
-      这个路径不使用 bbox token、不创建 GND token、不训练 grounding head。
-
-    model.py-full:
-      在 base 序列和 planner 之外，额外启用 bbox token、GND1/GND2、grounding head，
-      并把 grounding 的 spatial embedding 注入 ACT hidden。
 
     典型输入 shape:
       coarse_tokens: (B, 2, Nc, C)
@@ -736,9 +1192,11 @@ class MultiAgentOpenTrackVLA(nn.Module):
     核心数据流：
     1. 每个 Agent 的历史粗 token / 当前细 token 先通过 projector 映射到 LLM hidden size。
     2. TVI 给视觉 token 加上时间、Agent、视角、类型编码，并可插入帧级 marker。
-    3. base 序列可选是否在两个视觉流前加入 Agent 文本 marker。
-    4. ACT1/ACT2 位置的隐藏状态分别进入两个 planner head，输出两套路点。
-    5. full 模式才会把 bbox token 拼入视觉流，并追加 GND1/GND2 做 bbox/visibility/relative_pose。
+    3. 每个 Agent 的 bbox 被编码成一个 bbox token，拼到对应视觉流末尾。
+    4. 序列按 [文本, agent1视觉, agent2视觉, ACT1, ACT2, GND1, GND2] 喂给 LLM，
+       使因果 LLM 的两个 ACT 查询都能读取完整双视角上下文。
+    5. ACT1/ACT2 位置的隐藏状态分别进入两个 planner head，输出两套路点。
+    6. GND1/GND2 分别进入共享逐 Agent grounding head，输出各自 bbox/visibility。
     """
 
     def __init__(self, cfg: MultiAgentModelConfig, vision_feat_dim: int):
@@ -749,42 +1207,41 @@ class MultiAgentOpenTrackVLA(nn.Module):
         - proj: 把 DINO/SigLIP 拼接后的视觉维度 C 投影到 LLM 维度 D。
         - tvi: 注入时间、Agent、视角、token 类型和 bbox 信息。
         - planner_agent1/2: 两个独立规划头，避免无人机/机器狗动作分布被强行共享。
-        - grounding_head: 仅 full 模式存在，用于 bbox refinement 与 visibility 辅助监督。
+        - grounding_head: 逐 Agent absolute detection / bbox refinement / visibility 辅助头。
         """
         super().__init__()
         if cfg.num_agents != 2:
             raise ValueError("MultiAgentOpenTrackVLA currently expects exactly two agents.")
         self.cfg = cfg
         rank = int(os.environ.get("RANK", "0"))
-        variant_name = "model.py-base" if cfg.is_base_variant else "model.py-full"
-        print(f"[MODEL][rank {rank}] variant={variant_name}", flush=True)
         t0 = time.time()
         print(f"[MODEL][rank {rank}] loading LLM weights: {cfg.llm_name}", flush=True)
-        load_kwargs = {"dtype": torch.bfloat16} if torch.cuda.is_available() else {}
-        use_modelscope = os.environ.get("TRACKVLA_USE_MODELSCOPE", "0").strip().lower() in {"1", "true", "yes", "on"}
-        if use_modelscope:
-            try:
-                from modelscope import AutoModel as MSAutoModel
-                from modelscope import AutoTokenizer as MSAutoTokenizer
+        try:
+            from modelscope import AutoModel as MSAutoModel
+            from modelscope import AutoTokenizer as MSAutoTokenizer
 
-                self.llm = MSAutoModel.from_pretrained(cfg.llm_name, **load_kwargs)
-                self.tokenizer = MSAutoTokenizer.from_pretrained(cfg.llm_name)
-            except Exception:
-                self.llm = AutoModel.from_pretrained(cfg.llm_name, **load_kwargs)
-                self.tokenizer = AutoTokenizer.from_pretrained(cfg.llm_name)
-        else:
+            self.llm = MSAutoModel.from_pretrained(
+                cfg.llm_name,
+                torch_dtype=torch.bfloat16 if torch.cuda.is_available() else None,
+            )
+            self.tokenizer = MSAutoTokenizer.from_pretrained(cfg.llm_name)
+        except Exception:
+            load_kwargs = {"dtype": torch.bfloat16} if torch.cuda.is_available() else {}
             self.llm = AutoModel.from_pretrained(cfg.llm_name, **load_kwargs)
             self.tokenizer = AutoTokenizer.from_pretrained(cfg.llm_name)
         print(f"[MODEL][rank {rank}] LLM/tokenizer loaded in {time.time() - t0:.1f}s", flush=True)
 
+        stage_start = time.time()
         self.llm.requires_grad_(not cfg.freeze_llm)
         self.llm_dtype = next(self.llm.parameters()).dtype
         self.D = int(self.llm.config.hidden_size)
+        print(
+            f"[MODEL][rank {rank}] LLM freeze={cfg.freeze_llm} hidden={self.D} "
+            f"configured in {time.time() - stage_start:.1f}s",
+            flush=True,
+        )
 
-        # =========================
-        # Shared model.py-base path
-        # =========================
-        # base 和 full 都会经过这一路：视觉投影 -> TVI 编码 -> LLM -> 两个 planner head。
+        stage_start = time.time()
         self.proj = CrossModalityProjector(vision_feat_dim, self.D)
         self.tvi = MultiAgentTVIEmbedder(
             self.D,
@@ -796,55 +1253,74 @@ class MultiAgentOpenTrackVLA(nn.Module):
 
         self.act_token_1 = nn.Parameter(torch.zeros(1, 1, self.D))
         self.act_token_2 = nn.Parameter(torch.zeros(1, 1, self.D))
+        self.gnd_token_1 = nn.Parameter(torch.zeros(1, 1, self.D))
+        self.gnd_token_2 = nn.Parameter(torch.zeros(1, 1, self.D))
         nn.init.normal_(self.act_token_1, std=0.02)
         nn.init.normal_(self.act_token_2, std=0.02)
+        nn.init.normal_(self.gnd_token_1, std=0.02)
+        nn.init.normal_(self.gnd_token_2, std=0.02)
+        print(
+            f"[MODEL][rank {rank}] projector/TVI/query tokens built in {time.time() - stage_start:.1f}s",
+            flush=True,
+        )
 
-        self.planner_agent1 = PlannerHead3L(self.D, cfg.n_waypoints, cfg.action_dims, cfg.use_tanh_actions)
-        self.planner_agent2 = PlannerHead3L(self.D, cfg.n_waypoints, cfg.action_dims, cfg.use_tanh_actions)
-
-        # ====================================
-        # Optional model.py-full grounding path
-        # ====================================
-        # 只有 full 模式会创建 GND token/head。base 模式不会产生这些可训练参数。
-        if cfg.use_grounding:
-            self.gnd_token_1 = nn.Parameter(torch.zeros(1, 1, self.D))
-            self.gnd_token_2 = nn.Parameter(torch.zeros(1, 1, self.D))
-            nn.init.normal_(self.gnd_token_1, std=0.02)
-            nn.init.normal_(self.gnd_token_2, std=0.02)
-            self.grounding_head = GroundingHead(self.D, cfg.num_agents, cfg.bbox_delta_scale)
-            self.grounding_to_act = nn.Sequential(
-                nn.LayerNorm(self.D),
-                nn.Linear(self.D, self.D),
-                nn.GELU(),
-                nn.Linear(self.D, self.D),
+        if cfg.use_anchor_diffusion:
+            stage_start = time.time()
+            # 如果没有分别指定，则允许两个 Agent 退回共享 diffusion_anchor_path；
+            # 实际训练时更推荐分别聚类并提供两套 anchor 文件。
+            agent1_anchor_path = cfg.diffusion_agent1_anchor_path or cfg.diffusion_anchor_path
+            agent2_anchor_path = cfg.diffusion_agent2_anchor_path or cfg.diffusion_anchor_path
+            agent1_anchors = _load_trajectory_anchors(
+                agent1_anchor_path,
+                cfg.diffusion_num_anchors,
+                cfg.n_waypoints,
+                cfg.action_dims,
             )
-            self.grounding_act_gate = nn.Parameter(torch.tensor(-2.0, dtype=torch.float32))
-            if not cfg.return_token_logits:
-                self.grounding_head.per_agent_token_query.requires_grad_(False)
+            agent2_anchors = _load_trajectory_anchors(
+                agent2_anchor_path,
+                cfg.diffusion_num_anchors,
+                cfg.n_waypoints,
+                cfg.action_dims,
+            )
+            diffusion_kwargs = dict(
+                condition_dim=self.D,
+                hidden_dim=cfg.diffusion_hidden_dim,
+                depth=cfg.diffusion_depth,
+                num_heads=cfg.diffusion_num_heads,
+                mlp_ratio=cfg.diffusion_mlp_ratio,
+                dropout=cfg.diffusion_dropout,
+                num_train_timesteps=cfg.diffusion_num_train_timesteps,
+                train_truncation_steps=cfg.diffusion_train_truncation_steps,
+                inference_start_timestep=cfg.diffusion_inference_start_timestep,
+                inference_steps=cfg.diffusion_inference_steps,
+                score_loss_weight=cfg.diffusion_score_loss_weight,
+                score_loss_reduction=cfg.diffusion_score_loss_reduction,
+                deterministic_inference=cfg.diffusion_deterministic_inference,
+            )
+            self.planner_agent1 = AnchorDiffusionActionModel(anchors=agent1_anchors, **diffusion_kwargs)
+            self.planner_agent2 = AnchorDiffusionActionModel(anchors=agent2_anchors, **diffusion_kwargs)
+            print(
+                f"[MODEL][rank {rank}] two anchor-diffusion planners built in {time.time() - stage_start:.1f}s",
+                flush=True,
+            )
         else:
-            self.grounding_head = None
-            self.grounding_to_act = None
-            self.register_parameter("gnd_token_1", None)
-            self.register_parameter("gnd_token_2", None)
-            self.register_parameter("grounding_act_gate", None)
+            self.planner_agent1 = PlannerHead3L(self.D, cfg.n_waypoints, cfg.action_dims, cfg.use_tanh_actions)
+            self.planner_agent2 = PlannerHead3L(self.D, cfg.n_waypoints, cfg.action_dims, cfg.use_tanh_actions)
+        self.grounding_head = GroundingHead(self.D, cfg.num_agents, cfg.bbox_delta_scale)
+        if not cfg.return_token_logits:
+            # 当前训练不计算 token-level grounding loss；冻结未使用分支，避免 DDP
+            # 每次 backward 搜索 unused parameters，也避免该分支被误计入可训练参数。
+            self.grounding_head.per_agent_token_query.requires_grad_(False)
 
         if not cfg.use_angle_tvi:
             for p in self.tvi.angle_proj.parameters():
                 p.requires_grad = False
-        if not cfg.use_bbox_tokens:
-            self.tvi.bbox_proj.requires_grad_(False)
 
         alpha = torch.ones(1, 1, cfg.action_dims, dtype=torch.float32)
         if cfg.alpha_xy is not None and cfg.action_dims >= 2:
             alpha[..., 0:2] = float(cfg.alpha_xy)
         self.register_buffer("alpha_task", alpha)
-
-    def train(self, mode: bool = True):
-        """Keep the frozen LLM in eval mode while training the lightweight heads."""
-        super().train(mode)
-        if getattr(self.cfg, "freeze_llm", False):
-            self.llm.eval()
-        return self
+        print(f"[MODEL][rank {rank}] multi-agent model construction complete", flush=True)
 
     def _embed_text(self, instructions: List[str], device: torch.device) -> Tuple[torch.Tensor, torch.Tensor]:
         """把自然语言指令转成 LLM 输入 embedding。
@@ -907,41 +1383,29 @@ class MultiAgentOpenTrackVLA(nn.Module):
         if not self.cfg.insert_time_tokens:
             return tokens
         B, N, _ = tokens.shape
-        device = tokens.device
-
-        # Grouping is metadata work. Keep it on CPU to avoid thousands of
-        # CUDA .item() synchronizations in the training forward pass.
-        tidx_cpu = t_idx.detach().to("cpu").clamp(0, self.tvi.time_emb.num_embeddings - 1).long()
-        first_tidx = tidx_cpu[0].tolist()
-        spans: List[Tuple[int, int]] = []
-        i = 0
-        while i < N:
-            j = i + 1
-            while j < N and first_tidx[j] == first_tidx[i]:
-                j += 1
-            spans.append((i, j))
-            i = j
-
-        pieces: List[torch.Tensor] = []
-        kind = torch.full((B,), int(kind_id), dtype=torch.long, device=device)
-        agent = torch.full((B,), int(agent_id), dtype=torch.long, device=device)
-        view = torch.full((B,), int(view_id), dtype=torch.long, device=device)
-        type_emb = self.tvi.kind_emb(kind) + self.tvi.agent_emb(agent) + self.tvi.view_emb(view)
-        for frame_idx, (start, end) in enumerate(spans):
-            tvals = tidx_cpu[:, start].to(device=device, non_blocking=True)
-            marker = self.tvi.time_emb(tvals) + type_emb
-            pieces.append(marker.unsqueeze(1))
-            if self.cfg.use_angle_tvi:
-                if yaw_per_frame is not None and frame_idx < yaw_per_frame.size(1):
-                    theta = yaw_per_frame[:, frame_idx].to(device=device, dtype=torch.float32)
-                else:
-                    theta = torch.zeros(B, device=device, dtype=torch.float32)
-                theta = (theta + math.pi) % (2 * math.pi) - math.pi
-                sincos = torch.stack([torch.sin(theta), torch.cos(theta)], dim=-1).to(self.tvi.angle_proj.weight.dtype)
-                angle = self.tvi.angle_proj(sincos) + type_emb
-                pieces.append(angle.unsqueeze(1))
-            pieces.append(tokens[:, start:end])
-        return torch.cat(pieces, dim=1)
+        out_list = []
+        for b in range(B):
+            tb = t_idx[b]
+            xb = tokens[b]
+            items = []
+            i = 0
+            fcount = 0
+            while i < N:
+                tcur = int(tb[i].item())
+                j = i + 1
+                while j < N and int(tb[j].item()) == tcur:
+                    j += 1
+                items.append(self.tvi.make_marker(tcur, kind_id, agent_id, view_id, xb.device).unsqueeze(0))
+                if self.cfg.use_angle_tvi:
+                    theta = 0.0
+                    if yaw_per_frame is not None and fcount < yaw_per_frame.size(1):
+                        theta = float(yaw_per_frame[b, fcount].item())
+                    items.append(self.tvi.make_angle_marker(theta, kind_id, agent_id, view_id, xb.device).unsqueeze(0))
+                items.append(xb[i:j])
+                i = j
+                fcount += 1
+            out_list.append(torch.cat(items, dim=0))
+        return torch.stack(out_list, dim=0)
 
     def _encode_agent_stream(
         self,
@@ -961,7 +1425,7 @@ class MultiAgentOpenTrackVLA(nn.Module):
         -> CrossModalityProjector 投影到 D维
         -> add_visual_tvi 加逐 token 时间/Agent/type 信息
         -> _interleave_markers 插入帧级 marker
-        -> 可选 make_bbox_token 添加当前 bbox token（full 模式）
+        -> make_bbox_token 添加当前 bbox token
 
         返回：
         - agent_seq: 喂给 LLM 的该 Agent 完整视觉序列。
@@ -975,144 +1439,8 @@ class MultiAgentOpenTrackVLA(nn.Module):
         visual_for_grounding = torch.cat([vis_c, vis_f], dim=1)
         seq_c = self._interleave_markers(vis_c, coarse_tidx, KIND_HISTORY, agent_id, view_id, yaw_hist)
         seq_f = self._interleave_markers(vis_f, fine_tidx, KIND_CURRENT, agent_id, view_id, yaw_curr)
-        pieces = [seq_c, seq_f]
-        if self.cfg.use_bbox_tokens:
-            pieces.append(self.tvi.make_bbox_token(bbox_feat, agent_id, view_id))
-        return torch.cat(pieces, dim=1), visual_for_grounding
-
-    def _base_grounding_stub(
-        self,
-        batch_size: int,
-        bbox: torch.Tensor,
-        has_bbox_prior: bool,
-        dtype: torch.dtype,
-        device: torch.device,
-    ) -> Dict[str, Optional[torch.Tensor]]:
-        """model.py-base 的 grounding 占位输出。
-
-        base 模式不训练 bbox/visibility/relative_pose。这里仍返回同名字段，
-        是为了让 train/eval 代码可以复用 full 模式的输出解析逻辑。
-        """
-        refined_bbox = bbox if has_bbox_prior else torch.zeros(batch_size, self.cfg.num_agents, 4, device=device)
-        return {
-            "refined_bbox": refined_bbox,
-            "absolute_bbox": refined_bbox,
-            "bbox_prior_mask": torch.full(
-                (batch_size, self.cfg.num_agents),
-                bool(has_bbox_prior),
-                dtype=torch.bool,
-                device=device,
-            ),
-            "relative_pose": None,
-            "spatial_emb": None,
-            "visible_logits": torch.zeros(batch_size, self.cfg.num_agents, dtype=dtype, device=device),
-            "visible_score": torch.full(
-                (batch_size, self.cfg.num_agents),
-                0.5,
-                dtype=dtype,
-                device=device,
-            ),
-            "token_logits": None,
-        }
-
-    def _embed_agent_role_marker(
-        self,
-        batch_size: int,
-        agent_id: int,
-        device: torch.device,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """把 Agent 身份说明转成文本 marker。
-
-        这是语言 token，不属于视觉流本身，所以不放进 _encode_agent_stream。
-        它作为 a*_seq 的前缀，显式告诉 LLM 后续视觉 token 属于哪个实体。
-        """
-        if agent_id == 0:
-            text = "Agent 0 is the aerial drone. The following visual tokens belong to the drone."
-        elif agent_id == 1:
-            text = "Agent 1 is the ground robot dog. The following visual tokens belong to the robot dog."
-        else:
-            raise ValueError(f"Unsupported agent_id={agent_id}")
-        return self._embed_text([text] * batch_size, device)
-
-    def _default_agent_role_text(self, agent_id: int) -> str:
-        if agent_id == 0:
-            return "Agent 0 is the aerial drone. The following visual tokens belong to the drone."
-        if agent_id == 1:
-            return "Agent 1 is the ground robot dog. The following visual tokens belong to the robot dog."
-        raise ValueError(f"Unsupported agent_id={agent_id}")
-
-    @staticmethod
-    def _ensure_text_batch(texts: Optional[List[str]], fallback: List[str], batch_size: int) -> List[str]:
-        if texts is None:
-            texts = fallback
-        if len(texts) != batch_size:
-            if len(texts) == 1:
-                texts = texts * batch_size
-            else:
-                raise ValueError(f"Expected {batch_size} instructions, got {len(texts)}")
-        return texts
-
-    def _build_shared_context_inputs(
-        self,
-        txt_emb: torch.Tensor,
-        txt_mask: torch.Tensor,
-        a1_seq: torch.Tensor,
-        a2_seq: torch.Tensor,
-        act1: torch.Tensor,
-        act2: torch.Tensor,
-        device: torch.device,
-        agent1_txt_emb: Optional[torch.Tensor] = None,
-        agent1_txt_mask: Optional[torch.Tensor] = None,
-        agent2_txt_emb: Optional[torch.Tensor] = None,
-        agent2_txt_mask: Optional[torch.Tensor] = None,
-    ) -> Tuple[List[torch.Tensor], List[torch.Tensor], int, int]:
-        """构造 shared-context LLM 输入 pieces。
-
-        base 默认顺序：
-        [joint_task_text, agent0_instruction, agent0_visual_seq,
-         agent1_instruction, agent1_visual_seq, ACT1, ACT2]
-
-        use_agent_text_markers=False 时严格使用：
-        [joint_task_text, agent0_visual_seq, agent1_visual_seq, ACT1, ACT2]
-
-        full 顺序保持原始结构：
-        [task_text, agent0_visual_seq, agent1_visual_seq, ACT1, ACT2]
-
-        agent instruction 不放进 a1_seq/a2_seq，原因是 a*_seq 表示“视觉 token 流”；
-        agent instruction 是语言提示，作为视觉流前缀更清楚，也不污染视觉编码函数。
-        """
-        B = txt_emb.size(0)
-        pieces: List[torch.Tensor] = [txt_emb]
-        masks: List[torch.Tensor] = [txt_mask]
-
-        def append_dense(piece: torch.Tensor) -> None:
-            pieces.append(piece)
-            masks.append(torch.ones(B, piece.size(1), dtype=torch.long, device=device))
-
-        def append_with_mask(piece: torch.Tensor, mask: torch.Tensor) -> None:
-            pieces.append(piece)
-            masks.append(mask)
-
-        if self.cfg.is_base_variant and self.cfg.use_agent_text_markers:
-            if agent1_txt_emb is None or agent1_txt_mask is None:
-                marker0, marker0_mask = self._embed_agent_role_marker(B, 0, device)
-                agent1_txt_emb, agent1_txt_mask = marker0, marker0_mask
-            if agent2_txt_emb is None or agent2_txt_mask is None:
-                marker1, marker1_mask = self._embed_agent_role_marker(B, 1, device)
-                agent2_txt_emb, agent2_txt_mask = marker1, marker1_mask
-            append_with_mask(agent1_txt_emb, agent1_txt_mask)
-            append_dense(a1_seq)
-            append_with_mask(agent2_txt_emb, agent2_txt_mask)
-            append_dense(a2_seq)
-        else:
-            append_dense(a1_seq)
-            append_dense(a2_seq)
-
-        act1_index = len(pieces)
-        append_dense(act1)
-        act2_index = len(pieces)
-        append_dense(act2)
-        return pieces, masks, act1_index, act2_index
+        bbox_tok = self.tvi.make_bbox_token(bbox_feat, agent_id, view_id)
+        return torch.cat([seq_c, seq_f, bbox_tok], dim=1), visual_for_grounding
 
     def _split_stacked_inputs(
         self,
@@ -1178,11 +1506,11 @@ class MultiAgentOpenTrackVLA(nn.Module):
         agent2_fine_tokens: Optional[torch.Tensor] = None,
         agent2_fine_tidx: Optional[torch.Tensor] = None,
         agent2_bbox_feat: Optional[torch.Tensor] = None,
+        bbox_valid_mask: Optional[torch.Tensor] = None,
         agent2_yaw_hist: Optional[torch.Tensor] = None,
         agent2_yaw_curr: Optional[torch.Tensor] = None,
-        joint_instructions: Optional[List[str]] = None,
-        agent1_instructions: Optional[List[str]] = None,
-        agent2_instructions: Optional[List[str]] = None,
+        target_waypoints: Optional[torch.Tensor] = None,
+        valid_mask: Optional[torch.Tensor] = None,
         return_dict: bool = True,
     ) -> Union[Dict[str, torch.Tensor], Tuple[torch.Tensor, torch.Tensor, Dict[str, Optional[torch.Tensor]]]]:
         """双 Agent 前向传播。
@@ -1194,7 +1522,9 @@ class MultiAgentOpenTrackVLA(nn.Module):
 
         主要输出：
         - waypoints: (B, 2, n_waypoints, 3)，两个 Agent 的未来局部路点。
-        - refined_bbox/visible_score: base 模式是兼容占位；full 模式是 grounding head 输出。
+        - bbox_valid_mask: (B, 2)，标记每个 Agent 是否有有效 bbox prior。
+        - refined_bbox: (B, 2, 4)，逐 Agent bbox 检测或 prior 修正。
+        - visible_logits/visible_score: (B, 2)，辅助可见性预测。
         """
         device = next(self.parameters()).device
         a1_c, a1_ct, a1_f, a1_ft, a2_c, a2_ct, a2_f, a2_ft = self._split_stacked_inputs(
@@ -1207,36 +1537,29 @@ class MultiAgentOpenTrackVLA(nn.Module):
         B = a1_c.size(0)
         if instructions is None:
             instructions = ["follow the person"] * B
-        joint_instructions = self._ensure_text_batch(joint_instructions, instructions, B)
-        use_agent_text = self.cfg.is_base_variant and self.cfg.use_agent_text_markers
-        if (
-            self.cfg.is_base_variant
-            and not self.cfg.use_agent_text_markers
-            and (agent1_instructions is not None or agent2_instructions is not None)
-        ):
-            raise ValueError(
-                "Per-agent instructions were provided while use_agent_text_markers=False. "
-                "Pass only the joint instruction for the five-piece shared base sequence."
-            )
-        if use_agent_text:
-            agent1_instructions = self._ensure_text_batch(
-                agent1_instructions,
-                [self._default_agent_role_text(0)] * B,
-                B,
-            )
-            agent2_instructions = self._ensure_text_batch(
-                agent2_instructions,
-                [self._default_agent_role_text(1)] * B,
-                B,
-            )
 
-        has_bbox_prior = bbox_feat is not None or agent1_bbox_feat is not None or agent2_bbox_feat is not None
         if bbox_feat is not None:
             bbox = self._normalize_bbox(bbox_feat, B, device)
+            available_prior_mask = torch.ones(B, self.cfg.num_agents, dtype=torch.bool, device=device)
         else:
             b1 = torch.zeros(B, 4, dtype=torch.float32, device=device) if agent1_bbox_feat is None else agent1_bbox_feat.to(device)
             b2 = torch.zeros(B, 4, dtype=torch.float32, device=device) if agent2_bbox_feat is None else agent2_bbox_feat.to(device)
             bbox = torch.stack([b1, b2], dim=1).float().clamp(0.0, 1.0)
+            available_prior_mask = torch.tensor(
+                [agent1_bbox_feat is not None, agent2_bbox_feat is not None],
+                dtype=torch.bool,
+                device=device,
+            ).view(1, self.cfg.num_agents).expand(B, -1)
+        if bbox_valid_mask is None:
+            prior_mask = available_prior_mask
+        else:
+            prior_mask = bbox_valid_mask.to(device=device, dtype=torch.bool)
+            if prior_mask.shape != (B, self.cfg.num_agents):
+                raise ValueError(
+                    f"bbox_valid_mask must have shape (B, {self.cfg.num_agents}), got {tuple(prior_mask.shape)}"
+                )
+            if torch.any(prior_mask & ~available_prior_mask):
+                raise ValueError("bbox_valid_mask marks an Agent valid, but no bbox prior was provided for it.")
 
         if yaw_hist is not None and yaw_hist.dim() == 3:
             agent1_yaw_hist, agent2_yaw_hist = yaw_hist[:, 0], yaw_hist[:, 1]
@@ -1252,270 +1575,105 @@ class MultiAgentOpenTrackVLA(nn.Module):
             yaw_hist=agent2_yaw_hist, yaw_curr=agent2_yaw_curr,
         )
 
-        # =========================
-        # Shared model.py-base path
-        # =========================
-        # 1. 全局联合指令始终进入 LLM；Agent 文本只在显式开启 marker 时计算。
-        txt_emb, txt_mask = self._embed_text(joint_instructions, device)
-        agent1_txt_emb = agent1_txt_mask = None
-        agent2_txt_emb = agent2_txt_mask = None
-        if use_agent_text:
-            agent1_txt_emb, agent1_txt_mask = self._embed_text(agent1_instructions, device)
-            agent2_txt_emb, agent2_txt_mask = self._embed_text(agent2_instructions, device)
-        # 2. base 只需要两个 ACT 查询 token，分别读取两个 Agent 的规划状态。
+        # 1. 文本指令先进入 LLM embedding 空间。
+        txt_emb, txt_mask = self._embed_text(instructions, device)
+        # 2. 四个可学习查询 token：
+        #    ACT1/ACT2 分别读取两个 Agent 的规划状态；GND1/GND2 分别绑定各自
+        #    Agent 坐标系，但都位于完整双视角上下文之后。
         act1 = self.tvi.make_query_token(self.act_token_1.expand(B, 1, -1), KIND_ACT, 0, 0)
         act2 = self.tvi.make_query_token(self.act_token_2.expand(B, 1, -1), KIND_ACT, 1, 1)
-        # 3. 构造 shared context；无 marker 模式严格为 [文本, a1视觉, a2视觉, ACT1, ACT2]。
-        pieces, mask_pieces, act1_index, act2_index = self._build_shared_context_inputs(
-            txt_emb,
-            txt_mask,
-            a1_seq,
-            a2_seq,
-            act1,
-            act2,
-            device,
-            agent1_txt_emb=agent1_txt_emb,
-            agent1_txt_mask=agent1_txt_mask,
-            agent2_txt_emb=agent2_txt_emb,
-            agent2_txt_mask=agent2_txt_mask,
-        )
-
-        def append_dense(piece: torch.Tensor) -> None:
-            pieces.append(piece)
-            mask_pieces.append(torch.ones(B, piece.size(1), dtype=torch.long, device=device))
-
-        if self.cfg.use_grounding:
-            # Optional model.py-full addition:
-            # GND token 只在 full 模式追加，位于完整双视角上下文之后。
-            gnd1 = self.tvi.make_query_token(self.gnd_token_1.expand(B, 1, -1), KIND_GND, 0, 0)
-            gnd2 = self.tvi.make_query_token(self.gnd_token_2.expand(B, 1, -1), KIND_GND, 1, 1)
-            append_dense(gnd1)
-            append_dense(gnd2)
+        gnd1 = self.tvi.make_query_token(self.gnd_token_1.expand(B, 1, -1), KIND_GND, 0, 0)
+        gnd2 = self.tvi.make_query_token(self.gnd_token_2.expand(B, 1, -1), KIND_GND, 1, 1)
+        # 3. 两个视觉流都放在查询 token 之前，保证因果 LLM 中 ACT1/ACT2 都能读取双视角信息。
+        pieces = [txt_emb, a1_seq, a2_seq, act1, act2, gnd1, gnd2]
         lengths = [p.size(1) for p in pieces]
-        act1_pos = sum(lengths[:act1_index])
-        act2_pos = sum(lengths[:act2_index])
+        act1_pos = sum(lengths[:3])
+        act2_pos = act1_pos + lengths[3]
+        gnd1_pos = sum(lengths[:-2])
+        gnd2_pos = sum(lengths) - 1
 
         seq = torch.cat(pieces, dim=1).to(dtype=self.llm_dtype)
-        attn = torch.cat(mask_pieces, dim=1)
-        # 4. LLM 在同一个上下文里融合文本、无人机视觉流和机器狗视觉流。
-        # full 模式下，视觉流尾部还包含 bbox token。
-        out = self.llm(inputs_embeds=seq, attention_mask=attn, output_hidden_states=False, use_cache=False)
-        hidden = out.last_hidden_state.float()
-        h_act1, h_act2 = hidden[:, act1_pos, :], hidden[:, act2_pos, :]
-        if self.cfg.use_grounding:
-            gnd1_pos = sum(lengths[:-2])
-            gnd2_pos = sum(lengths) - 1
-            h_gnd = torch.stack([hidden[:, gnd1_pos, :], hidden[:, gnd2_pos, :]], dim=1)
-            visual_tokens = torch.stack([a1_visual, a2_visual], dim=1) if a1_visual.size(1) == a2_visual.size(1) else None
-            # Without a bbox prior, predict an absolute normalized box. With a prior,
-            # preserve the original behavior and predict a bounded refinement.
-            grounding = self.grounding_head(
-                h_gnd,
-                bbox_feat=bbox if has_bbox_prior else None,
-                visual_tokens=visual_tokens,
-            )
-            # 5. 将 grounding 的空间 embedding 注入 ACT 状态，让 bbox/relative pose 辅助监督
-            # 不只停留在旁路 head，而能直接影响闭环跟踪动作。
-            spatial_emb = grounding["spatial_emb"]
-            gate = torch.sigmoid(self.grounding_act_gate).to(dtype=h_act1.dtype)
-            h_act1 = h_act1 + gate * self.grounding_to_act(spatial_emb[:, 0])
-            h_act2 = h_act2 + gate * self.grounding_to_act(spatial_emb[:, 1])
-        else:
-            grounding = self._base_grounding_stub(B, bbox, has_bbox_prior, h_act1.dtype, device)
-
-        # 5. Shared waypoint heads: base 和 full 都由两个独立 planner 输出动作。
-        agent1_waypoints = self.planner_agent1(h_act1) * self.alpha_task
-        agent2_waypoints = self.planner_agent2(h_act2) * self.alpha_task
-
-        if not return_dict:
-            return agent1_waypoints, agent2_waypoints, grounding
-        return {
-            "agent1_waypoints": agent1_waypoints,
-            "agent2_waypoints": agent2_waypoints,
-            "waypoints": torch.stack([agent1_waypoints, agent2_waypoints], dim=1),
-            "refined_bbox": grounding["refined_bbox"],
-            "absolute_bbox": grounding["absolute_bbox"],
-            "bbox_prior_mask": grounding["bbox_prior_mask"],
-            "relative_pose": grounding["relative_pose"],
-            "spatial_emb": grounding["spatial_emb"],
-            "visible_logits": grounding["visible_logits"],
-            "visible_score": grounding["visible_score"],
-            "token_logits": grounding["token_logits"],
-        }
-
-
-class MultiAgentSeparateOpenTrackVLA(MultiAgentOpenTrackVLA):
-    """双 Agent 独立上下文 waypoint-only 对照模型。
-
-    和 ``MultiAgentOpenTrackVLA`` 的 base 版本相比，本类刻意不把两个 Agent 的
-    visual pieces 拼进同一个 LLM 上下文：
-
-    - agent1: [文本, agent1视觉, ACT1] -> LLM -> planner_agent1
-    - agent2: [文本, agent2视觉, ACT2] -> LLM -> planner_agent2
-
-    这样可以检验“两个 Agent 共上下文互相可见”是否真的带来收益。为了让对照干净，
-    该类只支持 waypoint-only base 设置，不启用 bbox token 和 grounding head。
-    """
-
-    def __init__(self, cfg: MultiAgentModelConfig, vision_feat_dim: int):
-        if cfg.use_grounding or cfg.use_bbox_tokens:
-            raise ValueError(
-                "MultiAgentSeparateOpenTrackVLA is a waypoint-only base ablation; "
-                "set use_grounding=False and use_bbox_tokens=False."
-            )
-        super().__init__(cfg, vision_feat_dim)
-        rank = int(os.environ.get("RANK", "0"))
-        print(f"[MODEL][rank {rank}] separate_agent_context=True", flush=True)
-
-    def _forward_one_agent_context(
-        self,
-        txt_emb: torch.Tensor,
-        txt_mask: torch.Tensor,
-        agent_seq: torch.Tensor,
-        act_token: torch.Tensor,
-    ) -> torch.Tensor:
-        """Run one independent [text, one-agent visual, ACT] LLM context."""
-        B = agent_seq.size(0)
-        device = agent_seq.device
-        seq = torch.cat([txt_emb, agent_seq, act_token], dim=1).to(dtype=self.llm_dtype)
         attn = torch.cat(
-            [
-                txt_mask,
-                torch.ones(B, agent_seq.size(1) + 1, dtype=torch.long, device=device),
-            ],
+            [txt_mask, torch.ones(B, sum(lengths[1:]), dtype=torch.long, device=device)],
             dim=1,
         )
-        out = self.llm(inputs_embeds=seq, attention_mask=attn, output_hidden_states=False, use_cache=False)
-        return out.last_hidden_state[:, -1, :].float()
-
-    def _role_instructions(self, instructions: List[str], role: str, partner: str) -> List[str]:
-        """给独立上下文补充 Agent 身份，避免两次 LLM forward 读到完全相同的角色描述。"""
-        return [
-            f"You are the {role}. Track the same target person and coordinate with the {partner}. Task: {inst}"
-            for inst in instructions
-        ]
-
-    def forward(
-        self,
-        coarse_tokens: Optional[torch.Tensor] = None,
-        coarse_tidx: Optional[torch.Tensor] = None,
-        fine_tokens: Optional[torch.Tensor] = None,
-        fine_tidx: Optional[torch.Tensor] = None,
-        instructions: Optional[List[str]] = None,
-        bbox_feat: Optional[torch.Tensor] = None,
-        yaw_hist: Optional[torch.Tensor] = None,
-        yaw_curr: Optional[torch.Tensor] = None,
-        agent1_coarse_tokens: Optional[torch.Tensor] = None,
-        agent1_coarse_tidx: Optional[torch.Tensor] = None,
-        agent1_fine_tokens: Optional[torch.Tensor] = None,
-        agent1_fine_tidx: Optional[torch.Tensor] = None,
-        agent1_bbox_feat: Optional[torch.Tensor] = None,
-        agent1_yaw_hist: Optional[torch.Tensor] = None,
-        agent1_yaw_curr: Optional[torch.Tensor] = None,
-        agent2_coarse_tokens: Optional[torch.Tensor] = None,
-        agent2_coarse_tidx: Optional[torch.Tensor] = None,
-        agent2_fine_tokens: Optional[torch.Tensor] = None,
-        agent2_fine_tidx: Optional[torch.Tensor] = None,
-        agent2_bbox_feat: Optional[torch.Tensor] = None,
-        agent2_yaw_hist: Optional[torch.Tensor] = None,
-        agent2_yaw_curr: Optional[torch.Tensor] = None,
-        joint_instructions: Optional[List[str]] = None,
-        agent1_instructions: Optional[List[str]] = None,
-        agent2_instructions: Optional[List[str]] = None,
-        return_dict: bool = True,
-    ) -> Union[Dict[str, torch.Tensor], Tuple[torch.Tensor, torch.Tensor, Dict[str, Optional[torch.Tensor]]]]:
-        """双 Agent 独立上下文前向传播。
-
-        输出接口保持和 ``MultiAgentOpenTrackVLA`` 一致，方便复用 train/eval 代码；
-        grounding 字段均为 base 兼容占位。
-        """
-        device = next(self.parameters()).device
-        a1_c, a1_ct, a1_f, a1_ft, a2_c, a2_ct, a2_f, a2_ft = self._split_stacked_inputs(
-            coarse_tokens, coarse_tidx, fine_tokens, fine_tidx,
-            agent1_coarse_tokens, agent1_coarse_tidx, agent1_fine_tokens, agent1_fine_tidx,
-            agent2_coarse_tokens, agent2_coarse_tidx, agent2_fine_tokens, agent2_fine_tidx,
-        )
-        a1_c, a1_ct, a1_f, a1_ft = a1_c.to(device), a1_ct.to(device), a1_f.to(device), a1_ft.to(device)
-        a2_c, a2_ct, a2_f, a2_ft = a2_c.to(device), a2_ct.to(device), a2_f.to(device), a2_ft.to(device)
-        B = a1_c.size(0)
-        if instructions is None:
-            instructions = ["follow the person"] * B
-
-        has_bbox_prior = bbox_feat is not None or agent1_bbox_feat is not None or agent2_bbox_feat is not None
-        if bbox_feat is not None:
-            bbox = self._normalize_bbox(bbox_feat, B, device)
+        # 4. LLM 在同一个上下文里融合文本、无人机视觉流、机器狗视觉流和 bbox 先验。
+        out = self.llm(inputs_embeds=seq, attention_mask=attn, output_hidden_states=True, use_cache=False)
+        hidden = out.last_hidden_state.float()
+        h_act1, h_act2 = hidden[:, act1_pos, :], hidden[:, act2_pos, :]
+        h_gnd = torch.stack([hidden[:, gnd1_pos, :], hidden[:, gnd2_pos, :]], dim=1)
+        # 5. 两个 ACT 隐藏状态分别进入各自 planner head，输出实际单位路点。
+        action_output_agent1 = None
+        action_output_agent2 = None
+        if self.cfg.use_anchor_diffusion:
+            # target_waypoints: (B, 2, Nw, D)，分别监督无人机和机器狗的扩散头。
+            target1 = target_waypoints[:, 0] if target_waypoints is not None else None
+            target2 = target_waypoints[:, 1] if target_waypoints is not None else None
+            mask1 = valid_mask[:, 0] if valid_mask is not None else None
+            mask2 = valid_mask[:, 1] if valid_mask is not None else None
+            action_output_agent1 = self.planner_agent1(h_act1, target=target1, valid_mask=mask1)
+            action_output_agent2 = self.planner_agent2(h_act2, target=target2, valid_mask=mask2)
+            agent1_waypoints = action_output_agent1["trajectory"]
+            agent2_waypoints = action_output_agent2["trajectory"]
         else:
-            b1 = torch.zeros(B, 4, dtype=torch.float32, device=device) if agent1_bbox_feat is None else agent1_bbox_feat.to(device)
-            b2 = torch.zeros(B, 4, dtype=torch.float32, device=device) if agent2_bbox_feat is None else agent2_bbox_feat.to(device)
-            bbox = torch.stack([b1, b2], dim=1).float().clamp(0.0, 1.0)
-
-        if yaw_hist is not None and yaw_hist.dim() == 3:
-            agent1_yaw_hist, agent2_yaw_hist = yaw_hist[:, 0], yaw_hist[:, 1]
-        if yaw_curr is not None and yaw_curr.dim() == 3:
-            agent1_yaw_curr, agent2_yaw_curr = yaw_curr[:, 0], yaw_curr[:, 1]
-
-        a1_seq, _ = self._encode_agent_stream(
-            a1_c, a1_ct, a1_f, a1_ft, bbox[:, 0], 0,
-            yaw_hist=agent1_yaw_hist, yaw_curr=agent1_yaw_curr,
+            agent1_waypoints = self.planner_agent1(h_act1) * self.alpha_task
+            agent2_waypoints = self.planner_agent2(h_act2) * self.alpha_task
+        visual_tokens = torch.stack([a1_visual, a2_visual], dim=1) if self.cfg.return_token_logits and a1_visual.size(1) == a2_visual.size(1) else None
+        # Without a bbox prior, predict an absolute normalized box. With a prior,
+        # preserve the original behavior and predict a bounded refinement.
+        grounding = self.grounding_head(
+            h_gnd,
+            bbox_feat=bbox,
+            bbox_valid_mask=prior_mask,
+            visual_tokens=visual_tokens,
         )
-        a2_seq, _ = self._encode_agent_stream(
-            a2_c, a2_ct, a2_f, a2_ft, bbox[:, 1], 1,
-            yaw_hist=agent2_yaw_hist, yaw_curr=agent2_yaw_curr,
-        )
-
-        if joint_instructions is None and agent1_instructions is None and agent2_instructions is None:
-            drone_instructions = self._role_instructions(instructions, "aerial drone", "ground robot dog")
-            dog_instructions = self._role_instructions(instructions, "ground robot dog", "aerial drone")
-            txt_emb_drone, txt_mask_drone = self._embed_text(drone_instructions, device)
-            txt_emb_dog, txt_mask_dog = self._embed_text(dog_instructions, device)
-        else:
-            joint_instructions = self._ensure_text_batch(joint_instructions, instructions, B)
-            agent1_instructions = self._ensure_text_batch(
-                agent1_instructions,
-                [self._default_agent_role_text(0)] * B,
-                B,
-            )
-            agent2_instructions = self._ensure_text_batch(
-                agent2_instructions,
-                [self._default_agent_role_text(1)] * B,
-                B,
-            )
-            joint_emb, joint_mask = self._embed_text(joint_instructions, device)
-            agent1_txt_emb, agent1_txt_mask = self._embed_text(agent1_instructions, device)
-            agent2_txt_emb, agent2_txt_mask = self._embed_text(agent2_instructions, device)
-            txt_emb_drone = torch.cat([joint_emb, agent1_txt_emb], dim=1)
-            txt_mask_drone = torch.cat([joint_mask, agent1_txt_mask], dim=1)
-            txt_emb_dog = torch.cat([joint_emb, agent2_txt_emb], dim=1)
-            txt_mask_dog = torch.cat([joint_mask, agent2_txt_mask], dim=1)
-        act1 = self.tvi.make_query_token(self.act_token_1.expand(B, 1, -1), KIND_ACT, 0, 0)
-        act2 = self.tvi.make_query_token(self.act_token_2.expand(B, 1, -1), KIND_ACT, 1, 1)
-
-        h_act1 = self._forward_one_agent_context(txt_emb_drone, txt_mask_drone, a1_seq, act1)
-        h_act2 = self._forward_one_agent_context(txt_emb_dog, txt_mask_dog, a2_seq, act2)
-
-        grounding = self._base_grounding_stub(B, bbox, has_bbox_prior, h_act1.dtype, device)
-        agent1_waypoints = self.planner_agent1(h_act1) * self.alpha_task
-        agent2_waypoints = self.planner_agent2(h_act2) * self.alpha_task
 
         if not return_dict:
             return agent1_waypoints, agent2_waypoints, grounding
-        return {
+        result = {
             "agent1_waypoints": agent1_waypoints,
             "agent2_waypoints": agent2_waypoints,
             "waypoints": torch.stack([agent1_waypoints, agent2_waypoints], dim=1),
             "refined_bbox": grounding["refined_bbox"],
             "absolute_bbox": grounding["absolute_bbox"],
             "bbox_prior_mask": grounding["bbox_prior_mask"],
-            "relative_pose": grounding["relative_pose"],
-            "spatial_emb": grounding["spatial_emb"],
             "visible_logits": grounding["visible_logits"],
             "visible_score": grounding["visible_score"],
             "token_logits": grounding["token_logits"],
         }
+        if action_output_agent1 is not None and action_output_agent2 is not None:
+            result.update(
+                {
+                    "candidate_trajectories": torch.stack(
+                        [
+                            action_output_agent1["candidate_trajectories"],
+                            action_output_agent2["candidate_trajectories"],
+                        ],
+                        dim=1,
+                    ),
+                    "candidate_logits": torch.stack(
+                        [action_output_agent1["candidate_logits"], action_output_agent2["candidate_logits"]],
+                        dim=1,
+                    ),
+                    "candidate_scores": torch.stack(
+                        [action_output_agent1["candidate_scores"], action_output_agent2["candidate_scores"]],
+                        dim=1,
+                    ),
+                    "action_output_agent1": action_output_agent1,
+                    "action_output_agent2": action_output_agent2,
+                }
+            )
+            if "loss" in action_output_agent1 and "loss" in action_output_agent2:
+                result["action_loss"] = action_output_agent1["loss"] + action_output_agent2["loss"]
+                # 与 action_loss 保持一致，记录两个 Agent 的扩散损失分量合计值。
+                result["regression_loss"] = (
+                    action_output_agent1["regression_loss"] + action_output_agent2["regression_loss"]
+                )
+                result["score_loss"] = action_output_agent1["score_loss"] + action_output_agent2["score_loss"]
+        return result
 
 
 OpenTrackVLAMultiAgent = MultiAgentOpenTrackVLA
-OpenTrackVLAMultiAgentSeparate = MultiAgentSeparateOpenTrackVLA
 
 
 # ----------------------- 单 Agent离线推理数据集 -----------------------
@@ -1848,11 +2006,27 @@ def _run_inference(cfg):
 
     model = OpenTrackVLA(
         ModelConfig(
+            llm_name=str(ck_cfg.get('llm_name', "Qwen/Qwen3-0.6B")),
             n_waypoints=n_waypoints,
             beta_nav=float(ck_cfg.get('beta_nav', 10.0)),
             use_angle_tvi=use_angle_tvi,
             use_tanh_actions=(not no_tanh_actions),
-            alpha_xy=alpha_xy
+            alpha_xy=alpha_xy,
+            use_anchor_diffusion=bool(ck_cfg.get('use_anchor_diffusion', getattr(cfg, 'use_anchor_diffusion', False))),
+            diffusion_anchor_path=ck_cfg.get('diffusion_anchor_path', getattr(cfg, 'diffusion_anchor_path', None)),
+            diffusion_num_anchors=int(ck_cfg.get('diffusion_num_anchors', getattr(cfg, 'diffusion_num_anchors', 40))),
+            diffusion_hidden_dim=int(ck_cfg.get('diffusion_hidden_dim', 384)),
+            diffusion_depth=int(ck_cfg.get('diffusion_depth', 6)),
+            diffusion_num_heads=int(ck_cfg.get('diffusion_num_heads', 4)),
+            diffusion_mlp_ratio=float(ck_cfg.get('diffusion_mlp_ratio', 4.0)),
+            diffusion_dropout=float(ck_cfg.get('diffusion_dropout', 0.0)),
+            diffusion_num_train_timesteps=int(ck_cfg.get('diffusion_num_train_timesteps', 1000)),
+            diffusion_train_truncation_steps=int(ck_cfg.get('diffusion_train_truncation_steps', 50)),
+            diffusion_inference_start_timestep=int(ck_cfg.get('diffusion_inference_start_timestep', 10)),
+            diffusion_inference_steps=int(ck_cfg.get('diffusion_inference_steps', 2)),
+            diffusion_score_loss_weight=float(ck_cfg.get('diffusion_score_loss_weight', 100.0)),
+            diffusion_score_loss_reduction=str(ck_cfg.get('diffusion_score_loss_reduction', 'mean')),
+            diffusion_deterministic_inference=bool(ck_cfg.get('diffusion_deterministic_inference', False)),
         ),
         vision_feat_dim=vision_feat_dim,
     ).to(device).eval()
@@ -1969,7 +2143,12 @@ def parse_args():
     ap = argparse.ArgumentParser()
     ap.add_argument('--infer_json', type=str, required=True, help='Run inference on this dataset (json/jsonl/dir)')
     ap.add_argument('--infer_ckpt', type=str, default=None, help='Checkpoint to load for inference (defaults to latest in out_dir)')
-    ap.add_argument('--out_dir', type=str, default='/data/hdt/ntv_data/ckpt/ckpts_qwen4', help='Directory where checkpoints are stored (for default lookup)')
+    ap.add_argument(
+        '--out_dir',
+        type=str,
+        default='/data/hdt/ntv_data/ckpt/ckpts_multi_agent_anchor_diffusion',
+        help='Directory where checkpoints are stored (for default lookup)',
+    )
     ap.add_argument('--infer_out', type=str, default='./infer_out', help='Output directory for inference results')
     ap.add_argument('--infer_batches', type=int, default=0, help='Limit number of batches to run at inference (0 = all)')
     ap.add_argument('--infer_vis', action='store_true', help='Save visualization images during inference')
@@ -1981,6 +2160,10 @@ def parse_args():
     ap.add_argument('--vision_feat_dim', type=int, default=1536)
     ap.add_argument('--cache_root', type=str, default=None)
     ap.add_argument('--alpha_xy', type=float, default=None)
+    ap.add_argument('--use_anchor_diffusion', action='store_true')
+    ap.add_argument('--diffusion_anchor_path', type=str, default=None)
+    ap.add_argument('--diffusion_num_anchors', type=int, default=40)
+    ap.add_argument('--diffusion_score_loss_reduction', choices=['mean', 'sum'], default='mean')
     args = ap.parse_args()
     return args
 

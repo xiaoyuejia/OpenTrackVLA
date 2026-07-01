@@ -1,7 +1,10 @@
 {
+    "python.defaultInterpreterPath": "/home/hdt/miniconda3/envs/omtracknew/bin/python",
     "python-envs.defaultEnvManager": "ms-python.python:conda",
     "python-envs.defaultPackageManager": "ms-python.python:conda",
     "python.analysis.extraPaths": [
-        "./habitat-lab"
+        "./habitat-lab",
+        "./unrealzoo-gym",
+        "./unrealzoo-gym/example/DataRecording"
     ]
 }
