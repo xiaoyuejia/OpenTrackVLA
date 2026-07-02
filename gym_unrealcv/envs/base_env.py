@@ -1,4 +1,4 @@
-import os.path
+import os
 import re
 import time
 import warnings
@@ -12,6 +12,50 @@ from unrealcv.launcher import RunUnreal
 from gym_unrealcv.envs.agent.character import Character_API
 import random
 import sys
+
+
+def _resolve_unreal_binary(configured_path):
+    """Resolve stale machine-specific env_bin paths without editing every scene JSON."""
+    override = os.environ.get("UNREALZOO_ENV_BIN", "").strip()
+    candidates = []
+    if override:
+        candidates.append(override)
+    candidates.append(configured_path)
+
+    marker = "UnrealZoo_UE5_6_Linux_v3.0.0"
+    if marker in configured_path:
+        suffix = configured_path[configured_path.index(marker):]
+        candidates.extend(
+            [
+                os.path.join("/data/hdt/ntv_data/sim_data/unreal_env_writable", suffix),
+                os.path.join(
+                    "/data/hdt/UnrealZoo-UE5/UnrealZoo_UE5_6_v3.0.0/Linux",
+                    suffix,
+                ),
+            ]
+        )
+
+    checked = []
+    for candidate in candidates:
+        candidate = os.path.abspath(os.path.expanduser(candidate))
+        if candidate in checked:
+            continue
+        checked.append(candidate)
+        if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+            if candidate != os.path.abspath(os.path.expanduser(configured_path)):
+                print(
+                    f"[UnrealZoo] env_bin fallback: {configured_path} -> {candidate}",
+                    flush=True,
+                )
+            return candidate
+
+    raise FileNotFoundError(
+        "Unreal environment binary is missing or not executable. Checked:\n  "
+        + "\n  ".join(checked)
+        + "\nSet UNREALZOO_ENV_BIN to the installed UnrealZoo executable."
+    )
+
+
 ''' 
 It is a base env for general purpose agent-env interaction, including single/multi-agent navigation, tracking, etc.
 Observation : raw color image and depth
@@ -117,7 +161,7 @@ class UnrealCv_base(gym.Env):
 
         # config unreal env
         if 'linux' in sys.platform:
-            env_bin = setting['env_bin']
+            env_bin = _resolve_unreal_binary(setting['env_bin'])
         elif 'darwin' in sys.platform:
             env_bin = setting['env_bin_mac']
         elif 'win' in sys.platform:
@@ -128,6 +172,46 @@ class UnrealCv_base(gym.Env):
             env_map = None
 
         self.ue_binary = RunUnreal(ENV_BIN=env_bin, ENV_MAP=env_map)
+        self._configure_fixed_timestep_launch()
+        self._align_unrealcv_ini_with_real_binary()
+
+    def _configure_fixed_timestep_launch(self):
+        """Add deterministic UE launch flags when requested by an evaluator."""
+        raw_dt = os.environ.get("UNREALZOO_FIXED_TIMESTEP", "").strip()
+        if not raw_dt:
+            return
+        dt = float(raw_dt)
+        if dt <= 0.0:
+            raise ValueError(f"UNREALZOO_FIXED_TIMESTEP must be positive, got {raw_dt}")
+        fixed_fps = 1.0 / dt
+        original_set_options = self.ue_binary.set_ue_options
+
+        def set_options_with_fixed_step(
+            cmd_exe=[],
+            opengl=False,
+            offscreen=False,
+            nullrhi=False,
+            gpu_id=None,
+        ):
+            options = original_set_options(cmd_exe, opengl, offscreen, nullrhi, gpu_id)
+            options.extend(
+                [
+                    "-UseFixedTimeStep",
+                    f"-FPS={fixed_fps:.9g}",
+                    "-Deterministic",
+                ]
+            )
+            return options
+
+        self.ue_binary.set_ue_options = set_options_with_fixed_step
+
+    def _align_unrealcv_ini_with_real_binary(self):
+        # When the UE binary is a symlink, Unreal reads unrealcv.ini beside the
+        # real binary, while unrealcv.Launcher defaults to the symlink directory.
+        real_binary = os.path.realpath(self.ue_binary.path2binary)
+        real_unrealcv = os.path.join(os.path.dirname(real_binary), "unrealcv.ini")
+        if os.path.exists(real_unrealcv):
+            self.ue_binary.path2unrealcv = real_unrealcv
 
     def step(self, actions):
         """
@@ -423,7 +507,7 @@ class UnrealCv_base(gym.Env):
         self.unrealcv.set_obj_scale(name, refer_agent['scale'])
         self.unrealcv.set_obj_color(name, np.random.randint(0, 255, 3))
         self.unrealcv.set_random(name, 0)
-        self.unrealcv.set_interval(self.interval, name)
+        self.unrealcv.set_interval(name, self.interval)
         self.unrealcv.set_obj_location(name, loc)
         self.action_space.append(self.define_action_space(self.action_type, agent_info=new_dict))
         self.observation_space.append(self.define_observation_space(new_dict['cam_id'], self.observation_type, self.resolution))
@@ -461,7 +545,7 @@ class UnrealCv_base(gym.Env):
         self.unrealcv.set_obj_scale(name, refer_agent['scale'])
         self.unrealcv.set_obj_color(name, np.random.randint(0, 255, 3))
         self.unrealcv.set_random(name, 0)
-        self.unrealcv.set_interval(self.interval, name)
+        self.unrealcv.set_interval(name, self.interval)
         at = new_dict.get('agent_type', 'player')
         # Vehicle should stay static until explicit interaction/control.
         # Apply before set_obj_location as requested by demos.
@@ -708,9 +792,10 @@ class UnrealCv_base(gym.Env):
 
     def launch_ue_env(self):
         # launch the UE4 binary
+        self._align_unrealcv_ini_with_real_binary()
         env_ip, env_port = self.ue_binary.start(docker=self.docker, resolution=self.resolution, display=self.display,
                                                opengl=self.use_opengl, offscreen=self.offscreen_rendering,
-                                               nullrhi=self.nullrhi,sleep_time=10)
+                                               nullrhi=self.nullrhi, gpu_id=self.gpu_id, sleep_time=10)
 
 
         # connect to UnrealCV Server
@@ -728,7 +813,7 @@ class UnrealCv_base(gym.Env):
         for obj in self.player_list:
             self.unrealcv.set_obj_scale(obj, self.agents[obj]['scale'])
             self.unrealcv.set_random(obj, 0)
-            self.unrealcv.set_interval(self.interval, obj)
+            self.unrealcv.set_interval(obj, self.interval)
 
         if self.player_list:
             self.unrealcv.build_color_dict(self.player_list)

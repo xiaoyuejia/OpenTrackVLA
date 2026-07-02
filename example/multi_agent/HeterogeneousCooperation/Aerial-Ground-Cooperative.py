@@ -1,16 +1,31 @@
 import argparse
+import os
 import random
+import sys
 import time
+from pathlib import Path
 
 import cv2
 import gym
+
+REPO_ROOT = Path(__file__).resolve().parents[3]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
 import gym_unrealcv  # noqa: F401
 import numpy as np
 from gym_unrealcv.envs.tracking.baseline import PoseTracker, DronePoseTracker
 from gym_unrealcv.envs.wrappers import time_dilation, early_done, monitor, augmentation, configUE
-from pynput import keyboard
-import os
-os.environ['UnrealEnv']='/media/wuk/T9/UnrealEnv/'
+
+try:
+    from pynput import keyboard
+except ImportError as exc:
+    keyboard = None
+    KEYBOARD_IMPORT_ERROR = exc
+else:
+    KEYBOARD_IMPORT_ERROR = None
+
+os.environ['UnrealEnv']='/data/hdt/unrealzoo-gym/UnrealEnv'
 
 def pick_reachable_goal(env, leader_obj, max_trials=12):
     """Sample a reachable goal for leader by probing nav path."""
@@ -156,9 +171,13 @@ if __name__ == "__main__":
     follower_2 = 2
     drone_id = 3
 
-    listener = keyboard.Listener(on_press=on_press, on_release=on_release)
-    listener.start()
-    print("Drone keyboard override enabled: W/S A/D E/Q J/L.")
+    listener = None
+    if keyboard is not None:
+        listener = keyboard.Listener(on_press=on_press, on_release=on_release)
+        listener.start()
+        print("Drone keyboard override enabled: W/S A/D E/Q J/L.")
+    else:
+        print(f"Drone keyboard override disabled: {KEYBOARD_IMPORT_ERROR}")
 
     try:
         for eps in range(args.episodes):
@@ -206,5 +225,6 @@ if __name__ == "__main__":
                     print(f"[Episode {eps}] done, fps={fps:.2f}, rewards={cum_rewards}")
                     break
     finally:
-        listener.stop()
+        if listener is not None:
+            listener.stop()
         env.close()

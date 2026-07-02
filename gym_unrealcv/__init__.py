@@ -2,10 +2,71 @@ __version__ = "2.0.3"
 from gym.envs.registration import register
 import logging
 import os
+import re
 from gym_unrealcv.envs.utils.misc import load_env_setting
 logger = logging.getLogger(__name__)
 use_docker = False  # True: use nvidia docker   False: do not use nvidia-docker
 
+
+_real_register = register
+_fast_env_id = os.environ.get("UNREALZOO_FAST_ENV_ID", "").strip()
+
+
+def _split_task_env_id(env_id):
+    match = re.match(
+        r"^Unreal(?P<task>Agent|Rendezvous|Rescue|Track|Navigation|NavigationMulti)-"
+        r"(?P<env>.+)-(?P<action>Discrete|Continuous|Mixed)"
+        r"(?P<obs>Color|Depth|Rgbd|Gray|CG|Mask|Pose|MaskDepth|ColorMask)-v(?P<reset>\d+)$",
+        env_id,
+    )
+    return match.groupdict() if match else None
+
+
+def _register_fast_env(env_id):
+    parts = _split_task_env_id(env_id)
+    if not parts:
+        return False
+
+    task = parts["task"]
+    env = parts["env"]
+    action = parts["action"]
+    obs = parts["obs"]
+    reset = int(parts["reset"])
+
+    if task == "Agent":
+        _real_register(
+            id=env_id,
+            entry_point="gym_unrealcv.envs:UnrealCv_base",
+            kwargs={
+                "setting_file": os.path.join("env_config", f"{env}.json"),
+                "action_type": action,
+                "observation_type": obs,
+                "reset_type": reset,
+            },
+            max_episode_steps=500,
+        )
+        return True
+
+    max_steps = 1000 if task == "Navigation" else 500
+    _real_register(
+        id=env_id,
+        entry_point=f"gym_unrealcv.envs:{task}",
+        kwargs={
+            "env_file": os.path.join(task, f"{env}.json"),
+            "action_type": action,
+            "observation_type": obs,
+            "reset_type": reset,
+        },
+        max_episode_steps=max_steps,
+    )
+    return True
+
+
+if _fast_env_id and _register_fast_env(_fast_env_id):
+    logger.info("Fast-registered UnrealZoo env: %s", _fast_env_id)
+
+    def register(*args, **kwargs):
+        return None
 
 
 # ------------------------------------------------------------------

@@ -1,6 +1,6 @@
 {
     "env_name": "ChineseWaterTown_Ver1",
-    "env_bin": "UnrealZoo_UE5_6_Linux_v3.0.0/Linux/UnrealZoo_UE5_6/Binaries/Linux/UnrealZoo_UE5_6",
+    "env_bin": "/data/hdt/newtrackvla/sim_data/unreal_env_writable/UnrealZoo_UE5_6_Linux_v3.0.0/Linux/UnrealZoo_UE5_6/Binaries/Linux/UnrealZoo_UE5_6",
     "env_map": "ChineseWaterTown_Ver1",
     "env_bin_win": "UnrealZoo_UE5_6_Win64_v3.0.0/UnrealZoo_UE5_6/Binaries/Win64/UnrealZoo_UE5_6.exe",
     "env_bin_mac": "/wait/for/update",

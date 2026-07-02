@@ -320,6 +320,8 @@ class Character_API(UnrealCv_API):
             res = self.client.request(cmd, -1)
 
     def set_interval(self, player, interval):
+        if not isinstance(player, str) and isinstance(interval, str):
+            player, interval = interval, player
         cmd = f'vbp {player} set_interval {interval}'
         res = None
         while res is None:
