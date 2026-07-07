@@ -1,10 +1,10 @@
 version: 1
-name: separate_realtime_gpu1
+name: base_marker_realtime_gpu1
 
 python_bin: /home/hdt/miniconda3/envs/omtracknew/bin/python
 pipeline: sh/run_multi_agent_eval.sh
 parallel: false
-comparison_dir: /data/hdt/ntv_data/sim_data/eval/realtime_base_marker_vs_separate_gpu1/separate_summary
+comparison_dir: /data/hdt/ntv_data/sim_data/eval/realtime_base_marker_vs_separate_gpu1/base_marker_summary
 
 common_env:
   EVAL_SCRIPT: eval_unrealzoo_multi_agent.py
@@ -24,12 +24,16 @@ common_env:
   EVAL_TARGET_PATH_MIN_SPACING: 100
   EVAL_TARGET_PATH_REACH_DISTANCE: 120
   EVAL_TARGET_GOAL_REACH_DISTANCE: 50
-  EVAL_TARGET_STOP_WAIT_MIN_STEPS: 5
-  EVAL_TARGET_STOP_WAIT_MAX_STEPS: 15
-  EVAL_INIT_FROM_RECORDED_AGENT_POSES: 1
-  EVAL_HUMAN_SPEED: 90
+  EVAL_TARGET_STOP_WAIT_MIN_STEPS: 0
+  EVAL_TARGET_STOP_WAIT_MAX_STEPS: 0
+  EVAL_INIT_FROM_RECORDED_AGENT_POSES: 0
+  EVAL_INIT_FOLLOWERS_BEHIND_TARGET: 1
+  # Default target speed is 0.9 m/s. Optional choices: 1.0, 1.1, 1.2 m/s.
+  # If changed, update agent max-speed overrides or remove them for shell defaults.
+  EVAL_HUMAN_SPEED: 0.9
 
-  # Keep these timing and dynamics values identical to the base_marker YAML.
+  # Realtime mode: UE continues while inference runs. The waypoint index is
+  # selected from the measured interval between consecutive observations.
   EVAL_DT: 0.1
   EVAL_HISTORY_FRAME_DT: 0.1
   EVAL_DETERMINISTIC_STEP: 0
@@ -42,7 +46,7 @@ common_env:
   EVAL_WAYPOINT_HORIZON_STEPS: 9
 
   EVAL_BBOX_SOURCE: none
-  EVAL_REQUIRE_VISUAL_TARGET: 0
+  EVAL_REQUIRE_VISUAL_TARGET: 1
   EVAL_REQUIRE_CENTERED_TARGET: 0
   EVAL_USE_MASK_VISIBILITY: 1
   EVAL_MIN_VISIBLE_RATIO: 0.001
@@ -56,20 +60,21 @@ common_env:
   EVAL_DRONE_VY_SCALE: 1.0
   EVAL_DRONE_YAW_SIGN: 1.0
   EVAL_DRONE_YAW_SCALE: 1.0
-  EVAL_DRONE_MAX_SPEED: 0.12
-  EVAL_DRONE_MAX_VX: 0.12
-  EVAL_DRONE_MAX_VY: 0.05
+  EVAL_DRONE_MAX_SPEED: 1.20
+  EVAL_DRONE_MAX_VX: 1.20
+  EVAL_DRONE_MAX_VY: 0.60
   EVAL_DRONE_MAX_YAW_RATE: 0.8
+  EVAL_DRONE_HEIGHT: 600
 
   EVAL_ROBOTDOG_MIN_FOLLOW_DIST: 4.5
   EVAL_ROBOTDOG_IDEAL_FOLLOW_DIST: 6.25
   EVAL_ROBOTDOG_MAX_FOLLOW_DIST: 8.0
   EVAL_ROBOTDOG_SUCCESS_DISTANCE: 8.0
   EVAL_ROBOTDOG_LOST_DISTANCE: 10.0
-  EVAL_ROBOTDOG_YAW_SIGN: 1.0
+  EVAL_ROBOTDOG_YAW_SIGN: 1.0 
   EVAL_ROBOTDOG_YAW_SCALE: 1.0
-  EVAL_ROBOTDOG_SPEED_GAIN: 1.0
-  EVAL_ROBOTDOG_MAX_SPEED: 1.05
+  EVAL_ROBOTDOG_SPEED_GAIN: 1.0 #机器狗速度增益
+  EVAL_ROBOTDOG_MAX_SPEED: 1.20
   EVAL_ROBOTDOG_MAX_TURN_DEG: 30.0
   EVAL_ROBOTDOG_MAX_LATERAL_SPEED: 0.45
   EVAL_ROBOTDOG_MAX_YAW_RATE: 1.0
@@ -84,18 +89,14 @@ common_env:
   EVAL_SNAP_HEADING: 0
 
 models:
-  - name: separate
-    checkpoint: /data/hdt/ntv_data/ckpt/data_multi_agent_model_py_separate_base_marker_b32_acc4_lr2e-5_gpu7
-    eval_root: /data/hdt/ntv_data/sim_data/eval/realtime_base_marker_vs_separate_gpu1/separate
+  - name: base_marker
+    checkpoint: /data/hdt/ntv_data/ckpt/data_multi_agent_model_py_base_marker_b32_acc4_lr2e-5_gpu6
+    eval_root: /data/hdt/ntv_data/sim_data/eval/realtime_base_marker_vs_separate_gpu1/base_marker
     gpu: 1
     render_gpu: 1
     env:
-      # Exact text setup from this checkpoint's train_config.json. Empty
-      # per-agent overrides preserve the role text used during training.
+      # Exact text setup from this checkpoint's train_config.json.
       EVAL_INSTRUCTION: The aerial drone and the ground robot dog must cooperatively track the same target person. The drone should follow the person from the air, and the robot dog should follow the same person on the ground.
       EVAL_JOINT_INSTRUCTION: The aerial drone and the ground robot dog must cooperatively track the same target person. The drone should follow the person from the air, and the robot dog should follow the same person on the ground.
-      EVAL_AGENT1_INSTRUCTION: ""
-      EVAL_AGENT2_INSTRUCTION: ""
-      
-      # CONFIG_PATH=/data/hdt/newtrackvla/config/eval_separate_realtime_gpu1.yaml \
-      # bash sh/run_multi_agent_eval_comparison.sh --overwrite
+      EVAL_AGENT1_INSTRUCTION: "The drone should follow the person from the air."
+      EVAL_AGENT2_INSTRUCTION: "The robot dog should follow the same person on the ground."

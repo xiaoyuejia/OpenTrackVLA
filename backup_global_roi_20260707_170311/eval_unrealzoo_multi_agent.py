@@ -48,12 +48,7 @@ import torch
 from PIL import Image
 from scipy.interpolate import CubicSpline
 
-from tools.cache_gridpool import (
-    VisionCacheConfig,
-    VisionFeatureCacher,
-    crop_target_roi,
-    grid_pool_tokens,
-)
+from tools.cache_gridpool import VisionCacheConfig, VisionFeatureCacher, grid_pool_tokens
 
 
 REPO_ROOT = Path(__file__).resolve().parent
@@ -471,24 +466,6 @@ def _draw_predicted_bbox(frame_bgr: np.ndarray, bbox_norm: Any, label: str = "mo
     return out
 
 
-def _draw_roi_crop_xyxy(frame_bgr: np.ndarray, crop_xyxy: Any, label: str = "oracle ROI crop") -> np.ndarray:
-    """Draw the ROI crop boundary for debugging only; model still sees the full frame branch."""
-    out = ensure_bgr_uint8(frame_bgr).copy()
-    try:
-        x1, y1, x2, y2 = [int(round(float(v))) for v in crop_xyxy[:4]]
-    except Exception:
-        return out
-    if x2 <= x1 or y2 <= y1:
-        return out
-    h, w = out.shape[:2]
-    x1, y1 = max(0, min(w - 1, x1)), max(0, min(h - 1, y1))
-    x2, y2 = max(0, min(w - 1, x2)), max(0, min(h - 1, y2))
-    color = (0, 220, 255)
-    cv2.rectangle(out, (x1, y1), (x2, y2), color, 2)
-    cv2.putText(out, label, (x1, min(h - 8, max(20, y2 + 18))), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
-    return out
-
-
 def _smooth_trajectory_pixels(traj_xyz: Any, width: int, height: int, scale: float) -> np.ndarray:
     """将稀疏局部轨迹转换成平滑像素曲线，不绘制 waypoint 点标记。"""
     traj = np.asarray(traj_xyz) if traj_xyz is not None else np.empty((0, 0))
@@ -614,23 +591,6 @@ class UnrealZooMultiAgentPlanner:
         print(f"[startup] checkpoint loaded in {time.time() - load_t0:.1f}s", flush=True)
         ckpt_cfg = obj.get("config", {}) if isinstance(obj, dict) else {}
         state = _cleanup_state_dict_keys(obj.get("model_state", {}) if isinstance(obj, dict) else {})
-        self.use_roi_tokens = bool(args.use_roi_tokens or ckpt_cfg.get("use_roi_tokens", False))
-        self.roi_token_count = int(ckpt_cfg.get("roi_token_count", args.roi_token_count))
-        self.roi_expand_ratio = float(ckpt_cfg.get("roi_expand_ratio", args.roi_expand_ratio))
-        self.roi_make_square = bool(ckpt_cfg.get("roi_make_square", args.roi_make_square))
-        self.roi_bbox_source = str(ckpt_cfg.get("roi_bbox_source", args.roi_bbox_source))
-        self.evaluation_protocol = (
-            "oracle_roi_upper_bound" if self.use_roi_tokens else str(ckpt_cfg.get("evaluation_protocol", "global_only"))
-        )
-        if self.use_roi_tokens:
-            side = int(round(math.sqrt(self.roi_token_count)))
-            if side * side != self.roi_token_count:
-                raise ValueError(f"ROI token count must be a perfect square, got {self.roi_token_count}")
-            if self.roi_bbox_source != "ground_truth":
-                raise NotImplementedError(
-                    f"roi_bbox_source={self.roi_bbox_source!r} is not implemented; "
-                    "current oracle-ROI evaluation only supports ground_truth."
-                )
         if ckpt_cfg.get("model_type") == "base_multi_agent_concat":
             raise RuntimeError(
                 "This checkpoint is a train_multi_agent_base.py / model_multi_agent_base.py base-concat checkpoint. "
@@ -642,8 +602,6 @@ class UnrealZooMultiAgentPlanner:
             or "planner_agent1.anchors" in state
             or "planner_agent2.anchors" in state
         )
-        if self.use_roi_tokens and self.use_anchor_diffusion:
-            raise NotImplementedError("ROI tokens are implemented for model.py MLP checkpoints, not Anchor Diffusion checkpoints.")
         if self.use_anchor_diffusion:
             expected_metadata = {
                 "grounding_architecture": "dual_agent_gnd_v2",
@@ -694,12 +652,6 @@ class UnrealZooMultiAgentPlanner:
                 "Cannot bind drone to planner_agent1 and robotdog to planner_agent2 safely."
             )
         self.ckpt_bbox_dropout_prob = float(ckpt_cfg.get("bbox_dropout_prob", 0.0))
-        if self.use_roi_tokens and args.bbox_source != "none":
-            print(
-                f"[planner] use_roi_tokens=True ignores --bbox-source={args.bbox_source!r} as a model numeric input; "
-                "bbox_feat=None and bbox tokens are disabled. Ground-truth bbox is used only as roi_bbox for cropping.",
-                flush=True,
-            )
         if args.bbox_source in {"model", "none"} and self.ckpt_bbox_dropout_prob <= 0.0:
             print(
                 "[planner][warn] checkpoint was not trained with bbox_dropout_prob > 0; "
@@ -726,21 +678,11 @@ class UnrealZooMultiAgentPlanner:
             return_token_logits=False,
         )
         if not self.use_anchor_diffusion:
-            ckpt_use_grounding = bool(ckpt_cfg.get("use_grounding", True))
-            ckpt_use_bbox_tokens = bool(ckpt_cfg.get("use_bbox_tokens", True))
             model_cfg_kwargs.update(
-                use_grounding=False if self.use_roi_tokens else ckpt_use_grounding,
-                use_bbox_tokens=False if self.use_roi_tokens else ckpt_use_bbox_tokens,
+                use_grounding=bool(ckpt_cfg.get("use_grounding", True)),
+                use_bbox_tokens=bool(ckpt_cfg.get("use_bbox_tokens", True)),
                 use_agent_text_markers=bool(ckpt_cfg.get("use_agent_text_markers", True)),
-                use_roi_tokens=self.use_roi_tokens,
-                roi_token_count=self.roi_token_count,
             )
-            if self.use_roi_tokens and (ckpt_use_grounding or ckpt_use_bbox_tokens):
-                print(
-                    "[planner] ROI protocol active: forcing use_grounding=False, "
-                    "use_bbox_tokens=False, bbox_feat=None. roi_bbox is used only for image crop.",
-                    flush=True,
-                )
         if self.use_anchor_diffusion:
             model_cfg_kwargs.update(
                 use_anchor_diffusion=True,
@@ -785,8 +727,6 @@ class UnrealZooMultiAgentPlanner:
                 flush=True,
             )
         critical_prefixes = ["planner_agent1.", "planner_agent2.", "proj.", "tvi."]
-        if self.use_roi_tokens:
-            critical_prefixes.append("roi_proj.")
         if self.use_anchor_diffusion or bool(ckpt_cfg.get("use_grounding", True)):
             critical_prefixes.extend(["grounding_head.", "grounding_to_act."])
         critical_missing = [key for key in missing if key.startswith(tuple(critical_prefixes))]
@@ -835,68 +775,17 @@ class UnrealZooMultiAgentPlanner:
         self.last_predicted_bbox = None
 
     @torch.inference_mode()
-    def _encode_pair(
-        self,
-        drone_frame_bgr: np.ndarray,
-        dog_frame_bgr: np.ndarray,
-        drone_roi_bbox: Optional[list[float]] = None,
-        dog_roi_bbox: Optional[list[float]] = None,
-    ) -> tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor], dict[str, Any]]:
+    def _encode_pair(self, drone_frame_bgr: np.ndarray, dog_frame_bgr: np.ndarray) -> tuple[torch.Tensor, torch.Tensor]:
         pils = []
         for frame in (drone_frame_bgr, dog_frame_bgr):
             rgb = cv2.cvtColor(ensure_bgr_uint8(frame), cv2.COLOR_BGR2RGB)
             pils.append(Image.fromarray(rgb))
-        global_t0 = time.perf_counter()
         tok_dino, hp, wp = self.encoder._encode_dino(pils)
         tok_sigl = self.encoder._encode_siglip(pils, out_hw=(hp, wp))
         tokens = torch.cat([tok_dino, tok_sigl], dim=-1)
         vfine = grid_pool_tokens(tokens, hp, wp, out_tokens=64).float().cpu()
         vcoarse = grid_pool_tokens(tokens, hp, wp, out_tokens=4).float().cpu()
-        global_encoding_time = time.perf_counter() - global_t0
-
-        roi_tokens = None
-        roi_valid = None
-        roi_encoding_time = 0.0
-        roi_crop_xyxy: list[list[int]] = [[0, 0, 0, 0], [0, 0, 0, 0]]
-        if self.use_roi_tokens:
-            # roi_bbox is oracle ground-truth here and is used only for image crop.
-            # It is never projected as bbox_feat or appended as a bbox token.
-            roi_pils: list[Image.Image] = []
-            roi_valid_values: list[bool] = []
-            try:
-                for idx, (pil, bbox) in enumerate(zip(pils, (drone_roi_bbox, dog_roi_bbox))):
-                    roi_img, valid, crop_xyxy = crop_target_roi(
-                        pil,
-                        bbox,
-                        bbox_format="xywh_pixel",
-                        expand_ratio=self.roi_expand_ratio,
-                        make_square=self.roi_make_square,
-                    )
-                    roi_pils.append(roi_img)
-                    roi_valid_values.append(bool(valid))
-                    roi_crop_xyxy[idx] = [int(v) for v in crop_xyxy]
-                roi_t0 = time.perf_counter()
-                roi_tokens = self.encoder.encode_pooled_tokens(roi_pils, self.roi_token_count).float().cpu()
-                roi_encoding_time = time.perf_counter() - roi_t0
-                roi_valid = torch.tensor(roi_valid_values, dtype=torch.bool)
-            finally:
-                for roi_img in roi_pils:
-                    try:
-                        roi_img.close()
-                    except Exception:
-                        pass
-
-        encode_info = {
-            "roi_bbox_source": self.roi_bbox_source if self.use_roi_tokens else None,
-            "evaluation_protocol": self.evaluation_protocol if self.use_roi_tokens else None,
-            "roi_valid": roi_valid.tolist() if roi_valid is not None else None,
-            "roi_crop_xyxy": roi_crop_xyxy if self.use_roi_tokens else None,
-            "roi_expand_ratio": self.roi_expand_ratio if self.use_roi_tokens else None,
-            "roi_token_count": self.roi_token_count if self.use_roi_tokens else None,
-            "global_encoding_time": float(global_encoding_time),
-            "roi_encoding_time": float(roi_encoding_time),
-        }
-        return vcoarse, vfine, roi_tokens, roi_valid, encode_info
+        return vcoarse, vfine
 
     def _history_tensor(
         self,
@@ -946,15 +835,8 @@ class UnrealZooMultiAgentPlanner:
         agent1_instruction: Optional[str] = None,
         agent2_instruction: Optional[str] = None,
         observation_time: Optional[float] = None,
-        drone_roi_bbox: Optional[list[float]] = None,
-        dog_roi_bbox: Optional[list[float]] = None,
     ) -> dict[str, Any]:
-        vcoarse, vfine, roi_tokens, roi_valid, encode_info = self._encode_pair(
-            drone_frame_bgr,
-            dog_frame_bgr,
-            drone_roi_bbox=drone_roi_bbox,
-            dog_roi_bbox=dog_roi_bbox,
-        )
+        vcoarse, vfine = self._encode_pair(drone_frame_bgr, dog_frame_bgr)
         if observation_time is None:
             observation_time = time.monotonic()
         coarse_items = []
@@ -973,9 +855,7 @@ class UnrealZooMultiAgentPlanner:
         fine_tokens = vfine.unsqueeze(0).to(self.device)
         fine_tidx = torch.full((1, 2, vfine.size(1)), self.history, dtype=torch.long, device=self.device)
         bbox_input = None
-        if self.use_roi_tokens:
-            bbox_input = None
-        elif self.args.bbox_source == "ground_truth":
+        if self.args.bbox_source == "ground_truth":
             bbox_input = [drone_bbox or [0.0] * 4, dog_bbox or [0.0] * 4]
         elif self.args.bbox_source == "model" and self.last_predicted_bbox is not None:
             bbox_input = self.last_predicted_bbox.tolist()
@@ -994,19 +874,6 @@ class UnrealZooMultiAgentPlanner:
             bbox_feat=bbox_feat,
             return_dict=True,
         )
-        if self.use_roi_tokens:
-            if roi_tokens is None or roi_valid is None:
-                raise RuntimeError("use_roi_tokens=True but online ROI encoding did not produce roi_tokens/roi_valid.")
-            model_kwargs.update(
-                roi_tokens=roi_tokens.unsqueeze(0).to(self.device),
-                roi_tidx=torch.full(
-                    (1, 2, roi_tokens.size(1)),
-                    self.history,
-                    dtype=torch.long,
-                    device=self.device,
-                ),
-                roi_valid=roi_valid.unsqueeze(0).to(self.device),
-            )
         if not self.use_anchor_diffusion:
             model_kwargs.update(
                 joint_instructions=[joint_instruction or instruction],
@@ -1035,7 +902,7 @@ class UnrealZooMultiAgentPlanner:
                     predicted_bbox[agent_idx] = absolute_bbox[agent_idx]
                     bbox_fallback_to_absolute[agent_idx] = True
         self.last_waypoints = waypoints
-        if self.args.bbox_source == "model" and not self.use_roi_tokens:
+        if self.args.bbox_source == "model":
             self.last_predicted_bbox = predicted_bbox
         candidate_logits = out.get("candidate_logits")
         candidate_scores = out.get("candidate_scores")
@@ -1063,14 +930,6 @@ class UnrealZooMultiAgentPlanner:
             "bbox_fallback_to_absolute": bbox_fallback_to_absolute,
             "best_candidate": best_candidate,
             "best_candidate_score": best_candidate_score,
-            "roi_bbox_source": encode_info.get("roi_bbox_source"),
-            "evaluation_protocol": encode_info.get("evaluation_protocol"),
-            "roi_valid": encode_info.get("roi_valid"),
-            "roi_crop_xyxy": encode_info.get("roi_crop_xyxy"),
-            "roi_expand_ratio": encode_info.get("roi_expand_ratio"),
-            "roi_token_count": encode_info.get("roi_token_count"),
-            "global_encoding_time": encode_info.get("global_encoding_time"),
-            "roi_encoding_time": encode_info.get("roi_encoding_time"),
         }
 
     def waypoints_to_actions(
@@ -2124,8 +1983,6 @@ def run_episode(
             agent1_instruction=getattr(args, "agent1_instruction", None),
             agent2_instruction=getattr(args, "agent2_instruction", None),
             observation_time=planner_observation_time,
-            drone_roi_bbox=drone_input_bbox if planner.use_roi_tokens else None,
-            dog_roi_bbox=dog_input_bbox if planner.use_roi_tokens else None,
         )
         drone_action, dog_action, action_debug = planner.waypoints_to_actions(
             pred["waypoints"],
@@ -2242,20 +2099,12 @@ def run_episode(
             dog_vis_frame = _render_bgr_frame_with_traj(
                 dog_vis_frame, pred["waypoints"][1], scale=args.trajectory_scale
             )
-        if planner.use_roi_tokens and pred.get("roi_crop_xyxy") is not None:
-            drone_vis_frame = _draw_roi_crop_xyxy(drone_vis_frame, pred["roi_crop_xyxy"][0], "oracle ROI crop")
-            dog_vis_frame = _draw_roi_crop_xyxy(dog_vis_frame, pred["roi_crop_xyxy"][1], "oracle ROI crop")
         drone_vis_frame = _overlay_text(
             _draw_predicted_bbox(drone_vis_frame, predicted_bbox[0], "model bbox"),
             [
                 f"ep={episode_id} step={step_idx + 1}",
                 f"drone d={drone_dist:.2f} bbox_iou={drone_bbox_iou:.2f}",
                 f"bbox_source={args.bbox_source} vis={float(visible_score[0]):.2f} abs_fallback={int(bbox_fallback[0])}",
-                (
-                    f"roi={pred.get('roi_bbox_source')} valid={int(bool((pred.get('roi_valid') or [False, False])[0]))}"
-                    if planner.use_roi_tokens
-                    else "roi=off"
-                ),
                 _candidate_label(best_candidate[0], best_candidate_score[0]),
                 "cmd_v="
                 f"[{action_debug['drone_physical_velocity_command'][0]:.2f},"
@@ -2269,11 +2118,6 @@ def run_episode(
                 f"ep={episode_id} step={step_idx + 1}",
                 f"dog d={dog_dist:.2f} bbox_iou={dog_bbox_iou:.2f}",
                 f"bbox_source={args.bbox_source} vis={float(visible_score[1]):.2f} abs_fallback={int(bbox_fallback[1])}",
-                (
-                    f"roi={pred.get('roi_bbox_source')} valid={int(bool((pred.get('roi_valid') or [False, False])[1]))}"
-                    if planner.use_roi_tokens
-                    else "roi=off"
-                ),
                 _candidate_label(best_candidate[1], best_candidate_score[1]),
                 f"cmd_v={dog_action[1] / UNREAL_UNITS_PER_METER:.2f}m/s "
                 f"turn={dog_action[0]:.1f}deg",
@@ -2284,8 +2128,6 @@ def run_episode(
         if args.write_global_video and global_frame is not None:
             frames_global.append(global_frame)
 
-        roi_valid_values = pred.get("roi_valid") or [None, None]
-        roi_crop_values = pred.get("roi_crop_xyxy") or [None, None]
         drone_infos.append(
             {
                 "step": step_idx + 1,
@@ -2297,14 +2139,6 @@ def run_episode(
                 "target_bbox": drone_bbox,
                 "bbox_feat": drone_bbox_norm_at_observation,
                 "model_bbox_input": pred.get("bbox_input", [None, None])[0] if pred.get("bbox_input") else None,
-                "roi_bbox_source": pred.get("roi_bbox_source"),
-                "evaluation_protocol": pred.get("evaluation_protocol"),
-                "roi_valid": roi_valid_values[0],
-                "roi_crop_xyxy": roi_crop_values[0],
-                "roi_expand_ratio": pred.get("roi_expand_ratio"),
-                "roi_token_count": pred.get("roi_token_count"),
-                "global_encoding_time_s": pred.get("global_encoding_time"),
-                "roi_encoding_time_s": pred.get("roi_encoding_time"),
                 "predicted_bbox": predicted_bbox[0],
                 "raw_refined_bbox": pred.get("raw_refined_bbox", [None, None])[0],
                 "absolute_bbox": pred.get("absolute_bbox", [None, None])[0],
@@ -2362,14 +2196,6 @@ def run_episode(
                 "target_bbox": dog_bbox,
                 "bbox_feat": dog_bbox_norm_at_observation,
                 "model_bbox_input": pred.get("bbox_input", [None, None])[1] if pred.get("bbox_input") else None,
-                "roi_bbox_source": pred.get("roi_bbox_source"),
-                "evaluation_protocol": pred.get("evaluation_protocol"),
-                "roi_valid": roi_valid_values[1],
-                "roi_crop_xyxy": roi_crop_values[1],
-                "roi_expand_ratio": pred.get("roi_expand_ratio"),
-                "roi_token_count": pred.get("roi_token_count"),
-                "global_encoding_time_s": pred.get("global_encoding_time"),
-                "roi_encoding_time_s": pred.get("roi_encoding_time"),
                 "predicted_bbox": predicted_bbox[1],
                 "raw_refined_bbox": pred.get("raw_refined_bbox", [None, None])[1],
                 "absolute_bbox": pred.get("absolute_bbox", [None, None])[1],
@@ -2432,14 +2258,6 @@ def run_episode(
                 "best_candidate_score": pred.get("best_candidate_score"),
                 "bbox_source": args.bbox_source,
                 "bbox_input": pred.get("bbox_input"),
-                "roi_bbox_source": pred.get("roi_bbox_source"),
-                "evaluation_protocol": pred.get("evaluation_protocol"),
-                "roi_valid": pred.get("roi_valid"),
-                "roi_crop_xyxy": pred.get("roi_crop_xyxy"),
-                "roi_expand_ratio": pred.get("roi_expand_ratio"),
-                "roi_token_count": pred.get("roi_token_count"),
-                "global_encoding_time_s": pred.get("global_encoding_time"),
-                "roi_encoding_time_s": pred.get("roi_encoding_time"),
                 "bbox_fallback_to_absolute": bbox_fallback,
                 "target_action": _jsonable_action(target_action),
                 "target_action_debug": setup.get("target_path_action_debug"),
@@ -2532,14 +2350,6 @@ def run_episode(
                 "robotdog_visible": bool(dog_visible),
                 "joint_following": bool(joint_following),
                 "action_debug": action_debug,
-                "roi_bbox_source": pred.get("roi_bbox_source"),
-                "evaluation_protocol": pred.get("evaluation_protocol"),
-                "roi_valid": pred.get("roi_valid"),
-                "roi_crop_xyxy": pred.get("roi_crop_xyxy"),
-                "roi_expand_ratio": pred.get("roi_expand_ratio"),
-                "roi_token_count": pred.get("roi_token_count"),
-                "global_encoding_time_s": pred.get("global_encoding_time"),
-                "roi_encoding_time_s": pred.get("roi_encoding_time"),
             }
             with (debug_dir / "planner_debug.jsonl").open("a", encoding="utf-8") as handle:
                 handle.write(json.dumps(debug_record, ensure_ascii=False) + "\n")
@@ -2686,17 +2496,6 @@ def run_episode(
         "failure_warmup_steps": int(args.failure_warmup_steps),
         "max_episode_seconds": float(args.max_episode_seconds),
         "bbox_source": args.bbox_source,
-        "use_roi_tokens": bool(planner.use_roi_tokens),
-        "roi_bbox_source": planner.roi_bbox_source if planner.use_roi_tokens else None,
-        "evaluation_protocol": planner.evaluation_protocol if planner.use_roi_tokens else None,
-        "roi_expand_ratio": float(planner.roi_expand_ratio) if planner.use_roi_tokens else None,
-        "roi_token_count": int(planner.roi_token_count) if planner.use_roi_tokens else None,
-        "roi_make_square": bool(planner.roi_make_square) if planner.use_roi_tokens else None,
-        "bbox_usage_note": (
-            "roi_bbox is ground-truth and used only for image cropping; bbox_feat=None."
-            if planner.use_roi_tokens
-            else None
-        ),
         "ckpt_bbox_dropout_prob": float(planner.ckpt_bbox_dropout_prob),
         "instruction": args.instruction,
         "joint_instruction": getattr(args, "joint_instruction", None) or args.instruction,
@@ -2875,23 +2674,6 @@ def parse_args() -> argparse.Namespace:
         default=0.01,
         help="Fallback to the model absolute bbox head when recurrent refined bbox width/height is smaller than this.",
     )
-    parser.add_argument(
-        "--use-roi-tokens",
-        action="store_true",
-        help=(
-            "Enable oracle target ROI visual tokens. In this protocol bbox is used only to crop ROI images; "
-            "bbox_feat and bbox tokens are disabled."
-        ),
-    )
-    parser.add_argument(
-        "--roi-bbox-source",
-        choices=["ground_truth", "external_detector", "external_tracker", "previous_model_prediction"],
-        default="ground_truth",
-        help="Source for ROI crop boxes. Only ground_truth is implemented in this oracle upper-bound version.",
-    )
-    parser.add_argument("--roi-expand-ratio", type=float, default=1.5)
-    parser.add_argument("--roi-token-count", type=int, default=16)
-    parser.add_argument("--roi-make-square", action=argparse.BooleanOptionalAction, default=True)
 
     parser.add_argument("--width", type=int, default=640)
     parser.add_argument("--height", type=int, default=480)

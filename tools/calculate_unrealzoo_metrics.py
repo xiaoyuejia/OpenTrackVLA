@@ -48,6 +48,8 @@ def calculate_metrics(eval_dir: Path) -> dict[str, Any] | None:
     joint_rates = []
     drone_rates = []
     dog_rates = []
+    drone_centered_rates = []
+    dog_centered_rates = []
     total_steps = []
     fps_values = []
     drone_bbox_ious = []
@@ -71,6 +73,10 @@ def calculate_metrics(eval_dir: Path) -> dict[str, Any] | None:
         joint_rates.append(joint_rate)
         drone_rates.append(drone_rate)
         dog_rates.append(dog_rate)
+        if "drone_centered_rate" in data:
+            drone_centered_rates.append(float(data["drone_centered_rate"]))
+        if "robotdog_centered_rate" in data:
+            dog_centered_rates.append(float(data["robotdog_centered_rate"]))
         total_steps.append(float(data.get("total_step", 0.0)))
         if "fps" in data:
             fps_values.append(float(data.get("fps", 0.0)))
@@ -96,6 +102,8 @@ def calculate_metrics(eval_dir: Path) -> dict[str, Any] | None:
         "JointTR": mean(joint_rates) * 100.0,
         "DroneTR": mean(drone_rates) * 100.0,
         "RobotDogTR": mean(dog_rates) * 100.0,
+        "DroneCentered": mean(drone_centered_rates) * 100.0 if drone_centered_rates else 0.0,
+        "RobotDogCentered": mean(dog_centered_rates) * 100.0 if dog_centered_rates else 0.0,
         "avg_steps": mean(total_steps),
         "avg_fps": mean(fps_values) if fps_values else 0.0,
         "DroneBBoxIoU": mean(drone_bbox_ious) * 100.0 if drone_bbox_ious else 0.0,
@@ -126,6 +134,8 @@ def main() -> int:
     print(f"Joint TR ↑:        {metrics['JointTR']:.2f}%")
     print(f"Drone TR ↑:        {metrics['DroneTR']:.2f}%")
     print(f"RobotDog TR ↑:     {metrics['RobotDogTR']:.2f}%")
+    print(f"Drone centered ↑:  {metrics['DroneCentered']:.2f}%")
+    print(f"Dog centered ↑:    {metrics['RobotDogCentered']:.2f}%")
     print(f"CR ↓:              {metrics['CR']:.2f}%")
     print(f"Drone bbox IoU ↑:  {metrics['DroneBBoxIoU']:.2f}%")
     print(f"Dog bbox IoU ↑:    {metrics['RobotDogBBoxIoU']:.2f}%")

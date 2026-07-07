@@ -11,7 +11,7 @@ SIM_DATA_DIR="${SIM_DATA_DIR:-/data/hdt/ntv_data/sim_data/unrealzoo_robotdog_hum
 OUTPUT_DIR="${OUTPUT_DIR:-/data/hdt/ntv_data/data/unrealzoo_robotdog_human_1k}"
 SCENES="${SCENES:-}"
 
-MIN_FOLLOWING_RATE="${MIN_FOLLOWING_RATE:-0.5}"
+MIN_FOLLOWING_RATE="${MIN_FOLLOWING_RATE:-0.0}"
 MIN_TOTAL_STEPS="${MIN_TOTAL_STEPS:-50}"
 HISTORY="${HISTORY:-31}"
 HORIZON="${HORIZON:-8}"

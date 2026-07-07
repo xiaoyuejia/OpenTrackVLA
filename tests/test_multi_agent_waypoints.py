@@ -2,6 +2,7 @@ from tools.make_tracking_data import (
     integrate_multi_agent_actions,
     resample_multi_agent_waypoints,
 )
+from eval_unrealzoo_multi_agent import waypoint_index_to_source_step
 
 
 def test_nine_actions_produce_origin_plus_nine_waypoints() -> None:
@@ -24,3 +25,12 @@ def test_partial_horizon_does_not_duplicate_loss_weight() -> None:
     assert waypoints[0] == [0.0, 0.0, 0.0]
     assert abs(waypoints[-1][0] - 0.2) < 1e-6
     assert sum(valid) == len(points)
+
+
+def test_origin_inclusive_waypoint_timing_matches_training_data() -> None:
+    steps = [
+        waypoint_index_to_source_step(index, waypoint_count=10, horizon_steps=9)
+        for index in range(10)
+    ]
+
+    assert steps == list(range(10))

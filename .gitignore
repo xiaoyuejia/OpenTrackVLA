@@ -28,6 +28,9 @@ ckpt*/
 
 *.glb
 *.jpg
+*.csv
+*.json
+*.mp4
 
 habitat-sim/
 pretrained_model/

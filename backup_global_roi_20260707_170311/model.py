@@ -61,7 +61,6 @@ KIND_CURRENT = 1
 KIND_BBOX = 2
 KIND_ACT = 3
 KIND_GND = 4
-KIND_ROI = 5
 
 
 def load_tokens_file(path: str) -> torch.Tensor:
@@ -420,7 +419,7 @@ class MultiAgentModelConfig:
     max_time: int = 4096
     max_views: int = 2
     num_agents: int = 2
-    num_kinds: int = 6
+    num_kinds: int = 5
     use_angle_tvi: bool = False
     insert_time_tokens: bool = True
     use_tanh_actions: bool = True
@@ -431,9 +430,6 @@ class MultiAgentModelConfig:
     return_token_logits: bool = False
     text_max_length: int = 128
     use_agent_text_markers: bool = True
-    use_roi_tokens: bool = False
-    roi_token_count: int = 16
-    use_separate_roi_projector: bool = True
 
     @property
     def is_base_variant(self) -> bool:
@@ -470,41 +466,6 @@ class MultiAgentTVIEmbedder(nn.Module):
             nn.Linear(4, d_model),
             nn.GELU(),
             nn.Linear(d_model, d_model),
-        )
-
-    def _load_from_state_dict(
-        self,
-        state_dict,
-        prefix,
-        local_metadata,
-        strict,
-        missing_keys,
-        unexpected_keys,
-        error_msgs,
-    ):
-        """Allow old no-ROI checkpoints with 5 kind embeddings to load into the 6-kind table.
-
-        KIND_ROI is appended at the end. Old rows keep their learned values, and
-        the new ROI row stays at this model's initialization. In use_roi_tokens=True
-        checkpoints, roi_proj.* is still required by the caller, so ROI models do
-        not silently evaluate with randomly initialized ROI projection weights.
-        """
-        key = prefix + "kind_emb.weight"
-        if key in state_dict:
-            loaded = state_dict[key]
-            current = self.kind_emb.weight
-            if loaded.shape[1:] == current.shape[1:] and loaded.shape[0] < current.shape[0]:
-                expanded = current.detach().clone()
-                expanded[: loaded.shape[0]] = loaded
-                state_dict[key] = expanded
-        super()._load_from_state_dict(
-            state_dict,
-            prefix,
-            local_metadata,
-            strict,
-            missing_keys,
-            unexpected_keys,
-            error_msgs,
         )
 
     def type_embedding(self, kind_id: int, agent_id: int, view_id: int, device: torch.device) -> torch.Tensor:
@@ -794,8 +755,6 @@ class MultiAgentOpenTrackVLA(nn.Module):
         if cfg.num_agents != 2:
             raise ValueError("MultiAgentOpenTrackVLA currently expects exactly two agents.")
         self.cfg = cfg
-        if cfg.use_roi_tokens and cfg.num_kinds <= KIND_ROI:
-            raise ValueError(f"use_roi_tokens=True requires num_kinds > {KIND_ROI}, got {cfg.num_kinds}")
         rank = int(os.environ.get("RANK", "0"))
         variant_name = "model.py-base" if cfg.is_base_variant else "model.py-full"
         print(f"[MODEL][rank {rank}] variant={variant_name}", flush=True)
@@ -827,10 +786,6 @@ class MultiAgentOpenTrackVLA(nn.Module):
         # =========================
         # base 和 full 都会经过这一路：视觉投影 -> TVI 编码 -> LLM -> 两个 planner head。
         self.proj = CrossModalityProjector(vision_feat_dim, self.D)
-        if cfg.use_roi_tokens:
-            self.roi_proj = CrossModalityProjector(vision_feat_dim, self.D)
-        else:
-            self.roi_proj = None
         self.tvi = MultiAgentTVIEmbedder(
             self.D,
             max_time=cfg.max_time,
@@ -998,10 +953,7 @@ class MultiAgentOpenTrackVLA(nn.Module):
         agent_id: int,
         yaw_hist: Optional[torch.Tensor] = None,
         yaw_curr: Optional[torch.Tensor] = None,
-        roi_tokens: Optional[torch.Tensor] = None,
-        roi_tidx: Optional[torch.Tensor] = None,
-        roi_valid: Optional[torch.Tensor] = None,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
         """编码单个 Agent 的视觉流。
 
         数据流：
@@ -1016,8 +968,6 @@ class MultiAgentOpenTrackVLA(nn.Module):
         - visual_for_grounding: 不含 marker/bbox 的视觉 token，用于可选 token grounding。
         """
         view_id = agent_id
-        B = coarse_tokens.size(0)
-        device = coarse_tokens.device
         vis_c = self.proj(coarse_tokens)
         vis_f = self.proj(fine_tokens)
         vis_c = self.tvi.add_visual_tvi(vis_c, coarse_tidx, KIND_HISTORY, agent_id, view_id)
@@ -1026,31 +976,9 @@ class MultiAgentOpenTrackVLA(nn.Module):
         seq_c = self._interleave_markers(vis_c, coarse_tidx, KIND_HISTORY, agent_id, view_id, yaw_hist)
         seq_f = self._interleave_markers(vis_f, fine_tidx, KIND_CURRENT, agent_id, view_id, yaw_curr)
         pieces = [seq_c, seq_f]
-        masks = [
-            torch.ones(B, seq_c.size(1), dtype=torch.long, device=device),
-            torch.ones(B, seq_f.size(1), dtype=torch.long, device=device),
-        ]
-        if self.cfg.use_roi_tokens:
-            if roi_tokens is None or roi_tidx is None:
-                raise ValueError("use_roi_tokens=True requires roi_tokens and roi_tidx.")
-            if self.roi_proj is None:
-                raise RuntimeError("ROI projector is missing while use_roi_tokens=True.")
-            rv = (
-                torch.ones(B, dtype=torch.bool, device=device)
-                if roi_valid is None
-                else roi_valid.to(device=device, dtype=torch.bool).view(B)
-            )
-            roi_in = roi_tokens.to(device)
-            roi_in = roi_in * rv.to(dtype=roi_in.dtype).view(B, 1, 1)
-            vis_roi = self.roi_proj(roi_in)
-            vis_roi = self.tvi.add_visual_tvi(vis_roi, roi_tidx.to(device), KIND_ROI, agent_id, view_id)
-            seq_roi = self._interleave_markers(vis_roi, roi_tidx.to(device), KIND_ROI, agent_id, view_id, yaw_curr)
-            pieces.append(seq_roi)
-            masks.append(rv.to(dtype=torch.long).view(B, 1).expand(B, seq_roi.size(1)))
         if self.cfg.use_bbox_tokens:
             pieces.append(self.tvi.make_bbox_token(bbox_feat, agent_id, view_id))
-            masks.append(torch.ones(B, 1, dtype=torch.long, device=device))
-        return torch.cat(pieces, dim=1), visual_for_grounding, torch.cat(masks, dim=1)
+        return torch.cat(pieces, dim=1), visual_for_grounding
 
     def _base_grounding_stub(
         self,
@@ -1133,8 +1061,6 @@ class MultiAgentOpenTrackVLA(nn.Module):
         act1: torch.Tensor,
         act2: torch.Tensor,
         device: torch.device,
-        a1_seq_mask: Optional[torch.Tensor] = None,
-        a2_seq_mask: Optional[torch.Tensor] = None,
         agent1_txt_emb: Optional[torch.Tensor] = None,
         agent1_txt_mask: Optional[torch.Tensor] = None,
         agent2_txt_emb: Optional[torch.Tensor] = None,
@@ -1175,12 +1101,12 @@ class MultiAgentOpenTrackVLA(nn.Module):
                 marker1, marker1_mask = self._embed_agent_role_marker(B, 1, device)
                 agent2_txt_emb, agent2_txt_mask = marker1, marker1_mask
             append_with_mask(agent1_txt_emb, agent1_txt_mask)
-            append_with_mask(a1_seq, a1_seq_mask.to(device) if a1_seq_mask is not None else torch.ones(B, a1_seq.size(1), dtype=torch.long, device=device))
+            append_dense(a1_seq)
             append_with_mask(agent2_txt_emb, agent2_txt_mask)
-            append_with_mask(a2_seq, a2_seq_mask.to(device) if a2_seq_mask is not None else torch.ones(B, a2_seq.size(1), dtype=torch.long, device=device))
+            append_dense(a2_seq)
         else:
-            append_with_mask(a1_seq, a1_seq_mask.to(device) if a1_seq_mask is not None else torch.ones(B, a1_seq.size(1), dtype=torch.long, device=device))
-            append_with_mask(a2_seq, a2_seq_mask.to(device) if a2_seq_mask is not None else torch.ones(B, a2_seq.size(1), dtype=torch.long, device=device))
+            append_dense(a1_seq)
+            append_dense(a2_seq)
 
         act1_index = len(pieces)
         append_dense(act1)
@@ -1230,47 +1156,6 @@ class MultiAgentOpenTrackVLA(nn.Module):
             agent2_coarse_tokens, agent2_coarse_tidx, agent2_fine_tokens, agent2_fine_tidx,
         )
 
-    def _split_stacked_roi_inputs(
-        self,
-        roi_tokens: Optional[torch.Tensor],
-        roi_tidx: Optional[torch.Tensor],
-        roi_valid: Optional[torch.Tensor],
-        agent1_roi_tokens: Optional[torch.Tensor],
-        agent1_roi_tidx: Optional[torch.Tensor],
-        agent1_roi_valid: Optional[torch.Tensor],
-        agent2_roi_tokens: Optional[torch.Tensor],
-        agent2_roi_tidx: Optional[torch.Tensor],
-        agent2_roi_valid: Optional[torch.Tensor],
-    ) -> Tuple[
-        Optional[torch.Tensor],
-        Optional[torch.Tensor],
-        Optional[torch.Tensor],
-        Optional[torch.Tensor],
-        Optional[torch.Tensor],
-        Optional[torch.Tensor],
-    ]:
-        if roi_tokens is not None:
-            if roi_tokens.dim() != 4 or roi_tidx is None:
-                raise ValueError("Stacked ROI inputs require roi_tokens shape (B, 2, N, C) and roi_tidx.")
-            if roi_valid is None:
-                roi_valid = torch.ones(roi_tokens.size(0), 2, dtype=torch.bool, device=roi_tokens.device)
-            return (
-                roi_tokens[:, 0],
-                roi_tidx[:, 0],
-                roi_valid[:, 0],
-                roi_tokens[:, 1],
-                roi_tidx[:, 1],
-                roi_valid[:, 1],
-            )
-        return (
-            agent1_roi_tokens,
-            agent1_roi_tidx,
-            agent1_roi_valid,
-            agent2_roi_tokens,
-            agent2_roi_tidx,
-            agent2_roi_valid,
-        )
-
     def forward(
         self,
         coarse_tokens: Optional[torch.Tensor] = None,
@@ -1279,9 +1164,6 @@ class MultiAgentOpenTrackVLA(nn.Module):
         fine_tidx: Optional[torch.Tensor] = None,
         instructions: Optional[List[str]] = None,
         bbox_feat: Optional[torch.Tensor] = None,
-        roi_tokens: Optional[torch.Tensor] = None,
-        roi_tidx: Optional[torch.Tensor] = None,
-        roi_valid: Optional[torch.Tensor] = None,
         yaw_hist: Optional[torch.Tensor] = None,
         yaw_curr: Optional[torch.Tensor] = None,
         agent1_coarse_tokens: Optional[torch.Tensor] = None,
@@ -1289,9 +1171,6 @@ class MultiAgentOpenTrackVLA(nn.Module):
         agent1_fine_tokens: Optional[torch.Tensor] = None,
         agent1_fine_tidx: Optional[torch.Tensor] = None,
         agent1_bbox_feat: Optional[torch.Tensor] = None,
-        agent1_roi_tokens: Optional[torch.Tensor] = None,
-        agent1_roi_tidx: Optional[torch.Tensor] = None,
-        agent1_roi_valid: Optional[torch.Tensor] = None,
         agent1_yaw_hist: Optional[torch.Tensor] = None,
         agent1_yaw_curr: Optional[torch.Tensor] = None,
         agent2_coarse_tokens: Optional[torch.Tensor] = None,
@@ -1299,9 +1178,6 @@ class MultiAgentOpenTrackVLA(nn.Module):
         agent2_fine_tokens: Optional[torch.Tensor] = None,
         agent2_fine_tidx: Optional[torch.Tensor] = None,
         agent2_bbox_feat: Optional[torch.Tensor] = None,
-        agent2_roi_tokens: Optional[torch.Tensor] = None,
-        agent2_roi_tidx: Optional[torch.Tensor] = None,
-        agent2_roi_valid: Optional[torch.Tensor] = None,
         agent2_yaw_hist: Optional[torch.Tensor] = None,
         agent2_yaw_curr: Optional[torch.Tensor] = None,
         joint_instructions: Optional[List[str]] = None,
@@ -1328,24 +1204,6 @@ class MultiAgentOpenTrackVLA(nn.Module):
         )
         a1_c, a1_ct, a1_f, a1_ft = a1_c.to(device), a1_ct.to(device), a1_f.to(device), a1_ft.to(device)
         a2_c, a2_ct, a2_f, a2_ft = a2_c.to(device), a2_ct.to(device), a2_f.to(device), a2_ft.to(device)
-        a1_roi, a1_roi_t, a1_roi_v, a2_roi, a2_roi_t, a2_roi_v = self._split_stacked_roi_inputs(
-            roi_tokens,
-            roi_tidx,
-            roi_valid,
-            agent1_roi_tokens,
-            agent1_roi_tidx,
-            agent1_roi_valid,
-            agent2_roi_tokens,
-            agent2_roi_tidx,
-            agent2_roi_valid,
-        )
-        if self.cfg.use_roi_tokens:
-            if a1_roi is None or a1_roi_t is None or a2_roi is None or a2_roi_t is None:
-                raise ValueError("use_roi_tokens=True requires stacked roi_tokens/roi_tidx or split agent ROI inputs.")
-            a1_roi, a1_roi_t = a1_roi.to(device), a1_roi_t.to(device)
-            a2_roi, a2_roi_t = a2_roi.to(device), a2_roi_t.to(device)
-            a1_roi_v = None if a1_roi_v is None else a1_roi_v.to(device)
-            a2_roi_v = None if a2_roi_v is None else a2_roi_v.to(device)
         B = a1_c.size(0)
         if instructions is None:
             instructions = ["follow the person"] * B
@@ -1385,15 +1243,13 @@ class MultiAgentOpenTrackVLA(nn.Module):
         if yaw_curr is not None and yaw_curr.dim() == 3:
             agent1_yaw_curr, agent2_yaw_curr = yaw_curr[:, 0], yaw_curr[:, 1]
 
-        a1_seq, a1_visual, a1_seq_mask = self._encode_agent_stream(
+        a1_seq, a1_visual = self._encode_agent_stream(
             a1_c, a1_ct, a1_f, a1_ft, bbox[:, 0], 0,
             yaw_hist=agent1_yaw_hist, yaw_curr=agent1_yaw_curr,
-            roi_tokens=a1_roi, roi_tidx=a1_roi_t, roi_valid=a1_roi_v,
         )
-        a2_seq, a2_visual, a2_seq_mask = self._encode_agent_stream(
+        a2_seq, a2_visual = self._encode_agent_stream(
             a2_c, a2_ct, a2_f, a2_ft, bbox[:, 1], 1,
             yaw_hist=agent2_yaw_hist, yaw_curr=agent2_yaw_curr,
-            roi_tokens=a2_roi, roi_tidx=a2_roi_t, roi_valid=a2_roi_v,
         )
 
         # =========================
@@ -1418,8 +1274,6 @@ class MultiAgentOpenTrackVLA(nn.Module):
             act1,
             act2,
             device,
-            a1_seq_mask=a1_seq_mask,
-            a2_seq_mask=a2_seq_mask,
             agent1_txt_emb=agent1_txt_emb,
             agent1_txt_mask=agent1_txt_mask,
             agent2_txt_emb=agent2_txt_emb,
@@ -1519,19 +1373,15 @@ class MultiAgentSeparateOpenTrackVLA(MultiAgentOpenTrackVLA):
         txt_mask: torch.Tensor,
         agent_seq: torch.Tensor,
         act_token: torch.Tensor,
-        agent_seq_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Run one independent [text, one-agent visual, ACT] LLM context."""
         B = agent_seq.size(0)
         device = agent_seq.device
         seq = torch.cat([txt_emb, agent_seq, act_token], dim=1).to(dtype=self.llm_dtype)
-        if agent_seq_mask is None:
-            agent_seq_mask = torch.ones(B, agent_seq.size(1), dtype=torch.long, device=device)
         attn = torch.cat(
             [
                 txt_mask,
-                agent_seq_mask.to(device=device, dtype=torch.long),
-                torch.ones(B, 1, dtype=torch.long, device=device),
+                torch.ones(B, agent_seq.size(1) + 1, dtype=torch.long, device=device),
             ],
             dim=1,
         )
@@ -1553,9 +1403,6 @@ class MultiAgentSeparateOpenTrackVLA(MultiAgentOpenTrackVLA):
         fine_tidx: Optional[torch.Tensor] = None,
         instructions: Optional[List[str]] = None,
         bbox_feat: Optional[torch.Tensor] = None,
-        roi_tokens: Optional[torch.Tensor] = None,
-        roi_tidx: Optional[torch.Tensor] = None,
-        roi_valid: Optional[torch.Tensor] = None,
         yaw_hist: Optional[torch.Tensor] = None,
         yaw_curr: Optional[torch.Tensor] = None,
         agent1_coarse_tokens: Optional[torch.Tensor] = None,
@@ -1563,9 +1410,6 @@ class MultiAgentSeparateOpenTrackVLA(MultiAgentOpenTrackVLA):
         agent1_fine_tokens: Optional[torch.Tensor] = None,
         agent1_fine_tidx: Optional[torch.Tensor] = None,
         agent1_bbox_feat: Optional[torch.Tensor] = None,
-        agent1_roi_tokens: Optional[torch.Tensor] = None,
-        agent1_roi_tidx: Optional[torch.Tensor] = None,
-        agent1_roi_valid: Optional[torch.Tensor] = None,
         agent1_yaw_hist: Optional[torch.Tensor] = None,
         agent1_yaw_curr: Optional[torch.Tensor] = None,
         agent2_coarse_tokens: Optional[torch.Tensor] = None,
@@ -1573,9 +1417,6 @@ class MultiAgentSeparateOpenTrackVLA(MultiAgentOpenTrackVLA):
         agent2_fine_tokens: Optional[torch.Tensor] = None,
         agent2_fine_tidx: Optional[torch.Tensor] = None,
         agent2_bbox_feat: Optional[torch.Tensor] = None,
-        agent2_roi_tokens: Optional[torch.Tensor] = None,
-        agent2_roi_tidx: Optional[torch.Tensor] = None,
-        agent2_roi_valid: Optional[torch.Tensor] = None,
         agent2_yaw_hist: Optional[torch.Tensor] = None,
         agent2_yaw_curr: Optional[torch.Tensor] = None,
         joint_instructions: Optional[List[str]] = None,
@@ -1596,24 +1437,6 @@ class MultiAgentSeparateOpenTrackVLA(MultiAgentOpenTrackVLA):
         )
         a1_c, a1_ct, a1_f, a1_ft = a1_c.to(device), a1_ct.to(device), a1_f.to(device), a1_ft.to(device)
         a2_c, a2_ct, a2_f, a2_ft = a2_c.to(device), a2_ct.to(device), a2_f.to(device), a2_ft.to(device)
-        a1_roi, a1_roi_t, a1_roi_v, a2_roi, a2_roi_t, a2_roi_v = self._split_stacked_roi_inputs(
-            roi_tokens,
-            roi_tidx,
-            roi_valid,
-            agent1_roi_tokens,
-            agent1_roi_tidx,
-            agent1_roi_valid,
-            agent2_roi_tokens,
-            agent2_roi_tidx,
-            agent2_roi_valid,
-        )
-        if self.cfg.use_roi_tokens:
-            if a1_roi is None or a1_roi_t is None or a2_roi is None or a2_roi_t is None:
-                raise ValueError("use_roi_tokens=True requires ROI inputs.")
-            a1_roi, a1_roi_t = a1_roi.to(device), a1_roi_t.to(device)
-            a2_roi, a2_roi_t = a2_roi.to(device), a2_roi_t.to(device)
-            a1_roi_v = None if a1_roi_v is None else a1_roi_v.to(device)
-            a2_roi_v = None if a2_roi_v is None else a2_roi_v.to(device)
         B = a1_c.size(0)
         if instructions is None:
             instructions = ["follow the person"] * B
@@ -1631,15 +1454,13 @@ class MultiAgentSeparateOpenTrackVLA(MultiAgentOpenTrackVLA):
         if yaw_curr is not None and yaw_curr.dim() == 3:
             agent1_yaw_curr, agent2_yaw_curr = yaw_curr[:, 0], yaw_curr[:, 1]
 
-        a1_seq, _, a1_seq_mask = self._encode_agent_stream(
+        a1_seq, _ = self._encode_agent_stream(
             a1_c, a1_ct, a1_f, a1_ft, bbox[:, 0], 0,
             yaw_hist=agent1_yaw_hist, yaw_curr=agent1_yaw_curr,
-            roi_tokens=a1_roi, roi_tidx=a1_roi_t, roi_valid=a1_roi_v,
         )
-        a2_seq, _, a2_seq_mask = self._encode_agent_stream(
+        a2_seq, _ = self._encode_agent_stream(
             a2_c, a2_ct, a2_f, a2_ft, bbox[:, 1], 1,
             yaw_hist=agent2_yaw_hist, yaw_curr=agent2_yaw_curr,
-            roi_tokens=a2_roi, roi_tidx=a2_roi_t, roi_valid=a2_roi_v,
         )
 
         if joint_instructions is None and agent1_instructions is None and agent2_instructions is None:
@@ -1669,8 +1490,8 @@ class MultiAgentSeparateOpenTrackVLA(MultiAgentOpenTrackVLA):
         act1 = self.tvi.make_query_token(self.act_token_1.expand(B, 1, -1), KIND_ACT, 0, 0)
         act2 = self.tvi.make_query_token(self.act_token_2.expand(B, 1, -1), KIND_ACT, 1, 1)
 
-        h_act1 = self._forward_one_agent_context(txt_emb_drone, txt_mask_drone, a1_seq, act1, a1_seq_mask)
-        h_act2 = self._forward_one_agent_context(txt_emb_dog, txt_mask_dog, a2_seq, act2, a2_seq_mask)
+        h_act1 = self._forward_one_agent_context(txt_emb_drone, txt_mask_drone, a1_seq, act1)
+        h_act2 = self._forward_one_agent_context(txt_emb_dog, txt_mask_dog, a2_seq, act2)
 
         grounding = self._base_grounding_stub(B, bbox, has_bbox_prior, h_act1.dtype, device)
         agent1_waypoints = self.planner_agent1(h_act1) * self.alpha_task

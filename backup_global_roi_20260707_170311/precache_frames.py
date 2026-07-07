@@ -9,20 +9,12 @@ import sys
 import time
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
+from typing import Any, Iterable, List, Optional, Set, Tuple
 
 import torch
 from PIL import Image
 
-from tools.cache_gridpool import (
-    VisionFeatureCacher,
-    VisionCacheConfig,
-    adapt_siglip_grid,
-    build_roi_cache_payload,
-    crop_target_roi,
-    grid_pool_tokens,
-    load_roi_cache,
-)
+from tools.cache_gridpool import VisionFeatureCacher, VisionCacheConfig, adapt_siglip_grid, grid_pool_tokens
 
 
 def _list_image_files(dir_path: Path) -> List[Path]:
@@ -311,60 +303,6 @@ def collect_multi_agent_refs_from_sample(paths: Set[str], sample: dict) -> None:
     add_multi_agent_path(paths, sample.get("current"))
 
 
-def _bbox_diff(a: Any, b: Any) -> float:
-    if not isinstance(a, list) or not isinstance(b, list) or len(a) < 4 or len(b) < 4:
-        return float("inf")
-    try:
-        return max(abs(float(a[i]) - float(b[i])) for i in range(4))
-    except Exception:
-        return float("inf")
-
-
-def _add_roi_ref(
-    roi_refs: Dict[str, Dict[str, Any]],
-    current: Any,
-    bbox: Any,
-    agent_name: str,
-    bbox_format: str = "cxcywh_norm",
-) -> None:
-    if not isinstance(current, str) or not current:
-        return
-    if not isinstance(bbox, list) or len(bbox) < 4:
-        return
-    try:
-        bbox_vals = [float(v) for v in bbox[:4]]
-    except Exception:
-        return
-    payload = {
-        "bbox": bbox_vals,
-        "bbox_format": bbox_format,
-        "agent_name": agent_name,
-    }
-    existing = roi_refs.get(current)
-    if existing is not None:
-        diff = _bbox_diff(existing.get("bbox"), payload["bbox"])
-        if diff > 1e-3:
-            print(
-                f"[warn] duplicate ROI bbox differs for {current}: "
-                f"first={existing.get('bbox')} new={payload['bbox']} max_diff={diff:.6g}",
-                flush=True,
-            )
-        return
-    roi_refs[current] = payload
-
-
-def collect_multi_agent_roi_refs_from_sample(roi_refs: Dict[str, Dict[str, Any]], sample: dict) -> None:
-    _add_roi_ref(roi_refs, sample.get("agent1_current"), sample.get("agent1_bbox"), str(sample.get("agent1_name", "agent1")))
-    _add_roi_ref(roi_refs, sample.get("agent2_current"), sample.get("agent2_bbox"), str(sample.get("agent2_name", "agent2")))
-
-    agents = sample.get("agents")
-    if isinstance(agents, dict):
-        for agent_name, payload in agents.items():
-            if not isinstance(payload, dict):
-                continue
-            _add_roi_ref(roi_refs, payload.get("current"), payload.get("bbox"), str(agent_name))
-
-
 def list_multi_agent_images(root: Path) -> List[Path]:
     """扫描目录下所有图片，供 --scan_frames 兜底使用。"""
     exts = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
@@ -422,44 +360,6 @@ def collect_multi_agent_frame_refs(
     return sorted(abs_paths)
 
 
-def collect_multi_agent_roi_refs(
-    data_root: Path,
-    json_root: Optional[Path],
-    dataset_json: Optional[Path],
-) -> Dict[Path, Dict[str, Any]]:
-    roi_refs: Dict[str, Dict[str, Any]] = {}
-    json_files: List[Path] = []
-
-    if json_root is not None and json_root.exists():
-        if json_root.is_file():
-            json_files.append(json_root)
-        else:
-            json_files.extend(sorted(json_root.rglob("*.jsonl")))
-            json_files.extend(sorted(json_root.rglob("*.json")))
-    else:
-        default_jsonl = data_root / "jsonl"
-        if default_jsonl.exists():
-            json_files.extend(sorted(default_jsonl.rglob("*.jsonl")))
-        if dataset_json is not None and dataset_json.exists():
-            json_files.append(dataset_json)
-        elif (data_root / "dataset.json").exists():
-            json_files.append(data_root / "dataset.json")
-
-    for path in json_files:
-        try:
-            iterator = iter_multi_agent_jsonl(path) if path.suffix.lower() == ".jsonl" else iter_multi_agent_json(path)
-            for sample in iterator:
-                collect_multi_agent_roi_refs_from_sample(roi_refs, sample)
-        except Exception as exc:
-            print(f"[warn] failed to read ROI refs from {path}: {exc}", flush=True)
-
-    out: Dict[Path, Dict[str, Any]] = {}
-    for rel, payload in roi_refs.items():
-        p = Path(rel)
-        out[p if p.is_absolute() else (data_root / p).resolve()] = payload
-    return out
-
-
 def rel_multi_agent_to_data_root(path: Path, data_root: Path) -> Path:
     """把绝对图片路径映射成相对 data_root 的缓存路径。
 
@@ -508,11 +408,6 @@ def save_multi_agent_token_pair(
         save_multi_agent_tensor(vfine_path, vf, save_float32)
     if not vcoarse_path.exists():
         save_multi_agent_tensor(vcoarse_path, vc, save_float32)
-
-
-def save_multi_agent_roi_payload(path: Path, payload: Dict[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    torch.save(payload, str(path))
 
 
 def drain_completed_saves(save_futures: Set[Future], block: bool = False) -> Tuple[int, int]:
@@ -573,21 +468,6 @@ def maybe_make_multi_agent_coarse_from_fine(vfine_path: Path, vcoarse_path: Path
         return False
 
 
-def roi_cache_is_valid(
-    path: Path,
-    roi_token_count: int,
-    roi_expand_ratio: float,
-    roi_make_square: bool,
-) -> bool:
-    if not path.exists():
-        return False
-    try:
-        load_roi_cache(path, roi_token_count, roi_expand_ratio, roi_make_square)
-        return True
-    except Exception:
-        return False
-
-
 def parse_multi_agent_precache_args() -> argparse.Namespace:
     """双 Agent 预缓存参数。
 
@@ -601,11 +481,6 @@ def parse_multi_agent_precache_args() -> argparse.Namespace:
     parser.add_argument("--scan_frames", action="store_true", help="Also scan every image under <data_root>/frames.")
     parser.add_argument("--image_size", type=int, default=384)
     parser.add_argument("--vision_resize_mode", choices=("letterbox", "stretch"), default="letterbox")
-    parser.add_argument("--with_roi", action="store_true", help="Also generate current-frame target ROI token caches.")
-    parser.add_argument("--roi_token_count", type=int, default=16)
-    parser.add_argument("--roi_expand_ratio", type=float, default=1.5)
-    parser.add_argument("--roi_make_square", action=argparse.BooleanOptionalAction, default=True)
-    parser.add_argument("--overwrite_roi", action="store_true")
     parser.add_argument("--batch_size", type=int, default=8)
     parser.add_argument("--num_shards", type=int, default=1, help="Split frame list into this many disjoint shards.")
     parser.add_argument("--shard_id", type=int, default=0, help="Zero-based shard index processed by this worker.")
@@ -639,12 +514,8 @@ def main_multi_agent_precache() -> None:
     json_root = Path(args.json_root).resolve() if args.json_root else None
     dataset_json = Path(args.dataset_json).resolve() if args.dataset_json else None
     cache_root.mkdir(parents=True, exist_ok=True)
-    roi_side = int(round(args.roi_token_count ** 0.5))
-    if roi_side * roi_side != int(args.roi_token_count):
-        raise ValueError("--roi_token_count must be a perfect square")
 
     frame_paths = collect_multi_agent_frame_refs(data_root, json_root, dataset_json, args.scan_frames)
-    roi_refs = collect_multi_agent_roi_refs(data_root, json_root, dataset_json) if args.with_roi else {}
     if args.num_shards < 1 or not 0 <= args.shard_id < args.num_shards:
         raise ValueError(f"invalid shard_id={args.shard_id} for num_shards={args.num_shards}")
     all_frame_count = len(frame_paths)
@@ -657,13 +528,6 @@ def main_multi_agent_precache() -> None:
     )
     print(f"Cache root: {cache_root}")
     print(f"Vision resize: image_size={args.image_size} mode={args.vision_resize_mode}")
-    if args.with_roi:
-        print(
-            f"ROI cache: refs={len(roi_refs)} token_count={args.roi_token_count} "
-            f"expand={args.roi_expand_ratio} square={args.roi_make_square} "
-            "roi_bbox_source=ground_truth evaluation_protocol=oracle_roi_upper_bound",
-            flush=True,
-        )
     if args.list_only:
         for path in frame_paths[:20]:
             print(path)
@@ -712,8 +576,7 @@ def main_multi_agent_precache() -> None:
                 failed += save_failed
 
             batch_paths = frame_paths[start : start + batch_size]
-            pending_global: List[Tuple[Path, Path, Path]] = []
-            pending_roi: List[Tuple[Path, Path, Dict[str, Any]]] = []
+            pending: List[Tuple[Path, Path, Path]] = []
             for img_path in batch_paths:
                 checked += 1
                 if not img_path.exists():
@@ -725,27 +588,18 @@ def main_multi_agent_precache() -> None:
                 token_dir = cache_root / rel.parent
                 vfine_path = token_dir / f"{rel.stem}_vfine.pt"
                 vcoarse_path = token_dir / f"{rel.stem}_vcoarse.pt"
-                if not (vfine_path.exists() and vcoarse_path.exists()):
-                    if maybe_make_multi_agent_coarse_from_fine(vfine_path, vcoarse_path, args.save_float32):
-                        generated += 1
-                        saved += 1
-                    else:
-                        pending_global.append((img_path, vfine_path, vcoarse_path))
+                if vfine_path.exists() and vcoarse_path.exists():
+                    continue
+                if maybe_make_multi_agent_coarse_from_fine(vfine_path, vcoarse_path, args.save_float32):
+                    generated += 1
+                    saved += 1
+                    continue
+                pending.append((img_path, vfine_path, vcoarse_path))
 
-                if args.with_roi and img_path in roi_refs:
-                    vroi_path = token_dir / f"{rel.stem}_vroi.pt"
-                    if args.overwrite_roi or not roi_cache_is_valid(
-                        vroi_path,
-                        args.roi_token_count,
-                        args.roi_expand_ratio,
-                        bool(args.roi_make_square),
-                    ):
-                        pending_roi.append((img_path, vroi_path, roi_refs[img_path]))
-
-            read_futures = [image_pool.submit(load_multi_agent_rgb, item[0]) for item in pending_global]
+            read_futures = [image_pool.submit(load_multi_agent_rgb, item[0]) for item in pending]
             pils: List[Image.Image] = []
             valid_pending: List[Tuple[Path, Path, Path]] = []
-            for item, fut in zip(pending_global, read_futures):
+            for item, fut in zip(pending, read_futures):
                 try:
                     pils.append(fut.result())
                     valid_pending.append(item)
@@ -772,49 +626,6 @@ def main_multi_agent_precache() -> None:
                     print(f"[warn] failed batch starting at frame {start}: {exc}", flush=True)
                 finally:
                     for pil in pils:
-                        pil.close()
-
-            roi_read_futures = [image_pool.submit(load_multi_agent_rgb, item[0]) for item in pending_roi]
-            roi_pils: List[Image.Image] = []
-            valid_roi_pending: List[Tuple[Path, Path, Dict[str, Any], bool, Tuple[int, int, int, int]]] = []
-            for item, fut in zip(pending_roi, roi_read_futures):
-                try:
-                    src = fut.result()
-                    meta = item[2]
-                    roi_img, roi_valid, crop_xyxy = crop_target_roi(
-                        src,
-                        meta.get("bbox"),
-                        meta.get("bbox_format", "cxcywh_norm"),
-                        expand_ratio=float(args.roi_expand_ratio),
-                        make_square=bool(args.roi_make_square),
-                    )
-                    src.close()
-                    roi_pils.append(roi_img)
-                    valid_roi_pending.append((item[0], item[1], meta, roi_valid, crop_xyxy))
-                except Exception as exc:
-                    failed += 1
-                    print(f"[warn] failed to crop ROI for {item[0]}: {exc}", flush=True)
-            if roi_pils:
-                try:
-                    roi_tokens = enc.encode_pooled_tokens(roi_pils, int(args.roi_token_count)).float().cpu()
-                    for index, (_img_path, vroi_path, meta, roi_valid, crop_xyxy) in enumerate(valid_roi_pending):
-                        payload = build_roi_cache_payload(
-                            roi_tokens[index].cpu(),
-                            roi_token_count=int(args.roi_token_count),
-                            roi_expand_ratio=float(args.roi_expand_ratio),
-                            roi_make_square=bool(args.roi_make_square),
-                            bbox_format=str(meta.get("bbox_format", "cxcywh_norm")),
-                            roi_valid=bool(roi_valid),
-                            crop_xyxy=crop_xyxy,
-                            save_float32=bool(args.save_float32),
-                        )
-                        save_futures.add(save_pool.submit(save_multi_agent_roi_payload, vroi_path, payload))
-                        generated += 1
-                except Exception as exc:
-                    failed += len(valid_roi_pending)
-                    print(f"[warn] failed ROI batch starting at frame {start}: {exc}", flush=True)
-                finally:
-                    for pil in roi_pils:
                         pil.close()
 
             now = time.time()

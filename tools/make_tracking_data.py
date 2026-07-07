@@ -133,11 +133,10 @@ def load_episode_status(status_json_path: Path) -> Optional[dict]:
 def action_field_order(preferred_field: Optional[str]) -> List[str]:
     """Return action label preference.
 
-    ``auto`` uses ``base_velocity`` first. This preserves Habitat, where
-    ``base_velocity`` is the expert command label, and also matches the current
-    UnrealZoo robotdog data where ``base_velocity`` is the executed body-frame
-    motion while ``commanded_base_velocity`` is often a saturated controller
-    request.
+    This is the static fallback order used for Habitat and legacy rows. Current
+    UnrealZoo rows carry ``command_label_source``/``env_action`` metadata and
+    ``extract_action3_from_step`` explicitly prefers
+    ``commanded_base_velocity`` for those rows.
     """
     preferred = (preferred_field or ACTION_FIELD_AUTO).strip()
     if not preferred or preferred == ACTION_FIELD_AUTO:
@@ -152,7 +151,13 @@ def action_field_order(preferred_field: Optional[str]) -> List[str]:
 def extract_action3_from_step(step: Dict[str, Any], preferred_field: Optional[str]) -> List[float]:
     """Extract [forward, lateral, yaw_rate] from one per-step record."""
     vals: Any = None
-    for key in action_field_order(preferred_field):
+    if (preferred_field or ACTION_FIELD_AUTO).strip() == ACTION_FIELD_AUTO and (
+        step.get("command_label_source") or step.get("env_action") is not None
+    ):
+        field_order = ["commanded_base_velocity", "base_velocity"]
+    else:
+        field_order = action_field_order(preferred_field)
+    for key in field_order:
         candidate = step.get(key)
         if isinstance(candidate, list) and len(candidate) >= 3:
             vals = candidate
@@ -439,6 +444,8 @@ def should_keep_multi_agent_episode(
             return False
         if float(dog_rate or 0.0) < min_agent_following_rate:
             return False
+        # centered/distance rates are retained as diagnostics and are not
+        # downstream hard filters.
 
     if not only_success:
         return True
@@ -474,12 +481,17 @@ def to_multi_agent_action3(step: Dict[str, Any], agent_name: str, preferred_fiel
     """把 UnrealZoo info 中的动作字段统一成 [vx, vy, yaw_rate]。
 
     处理逻辑：
-    - 默认 preferred_field=auto，优先使用 base_velocity。
-    - Habitat 中 base_velocity 是专家命令；UnrealZoo robotdog 中它是实际执行速度。
+    - 当前 UnrealZoo 行优先使用 commanded_base_velocity 专家命令。
+    - Habitat/旧数据在缺少命令元数据时优先使用 base_velocity。
     - drone_action 常见为 4 维，此时第 4 维作为 yaw_rate。
     - 缺失或格式异常时补 0，保证后续积分稳定。
     """
-    field_order = action_field_order(preferred_field)
+    if (preferred_field or ACTION_FIELD_AUTO).strip() == ACTION_FIELD_AUTO and (
+        step.get("command_label_source") or step.get("env_action") is not None
+    ):
+        field_order = ["commanded_base_velocity", "base_velocity"]
+    else:
+        field_order = action_field_order(preferred_field)
     if agent_name == "drone":
         field_order.extend(["drone_action"])
     elif agent_name == "robotdog":
@@ -858,7 +870,8 @@ def parse_multi_agent_args() -> argparse.Namespace:
         default=ACTION_FIELD_AUTO,
         help=(
             "Preferred action field in each *_info.json step. Default auto uses "
-            "base_velocity first and falls back to commanded_base_velocity."
+            "commanded_base_velocity for current UnrealZoo rows and base_velocity "
+            "for legacy/Habitat rows."
         ),
     )
     parser.add_argument("--instruction", type=str, default=None)
@@ -867,7 +880,7 @@ def parse_multi_agent_args() -> argparse.Namespace:
     parser.add_argument("--skip_collision_steps", action="store_true")
     parser.add_argument("--require_visible", action="store_true")
     parser.add_argument("--min_target_visibility", type=float, default=0.0)
-    parser.add_argument("--min_agent_following_rate", type=float, default=0.0)
+    parser.add_argument("--min_agent_following_rate", type=float, default=0.8)
     parser.add_argument("--min_total_steps", type=int, default=0)
     parser.add_argument("--allow_partial_horizon", action="store_true")
     parser.add_argument("--ffmpeg_quality", type=int, default=2)
@@ -1047,8 +1060,8 @@ def main():
         type=str,
         default=ACTION_FIELD_AUTO,
         help=(
-            "Preferred action field in each *_info.json step. Default auto uses "
-            "base_velocity first and falls back to commanded_base_velocity."
+            "Preferred action field. Auto uses commanded_base_velocity for current "
+            "UnrealZoo rows and base_velocity for legacy/Habitat rows."
         ),
     )
     args = parser.parse_args()

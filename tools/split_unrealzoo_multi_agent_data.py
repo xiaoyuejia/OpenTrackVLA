@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""将 UnrealZoo 双 Agent 原始 episode 按场景固定比例划分为训练集和测试集。
+"""将 UnrealZoo 双 Agent 原始 episode 按场景划分为训练集和测试集。
 
 每个 episode 以 ``*_drone_info.json`` 为索引，要求同时存在 Drone/RobotDog 的
 视频和 info。输出默认使用硬链接，不复制大型视频；目录结构保持与输入一致。
@@ -35,6 +35,21 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output-root", type=Path, required=True)
     parser.add_argument("--train-parts", type=int, default=10)
     parser.add_argument("--test-parts", type=int, default=1)
+    parser.add_argument(
+        "--test-count",
+        type=int,
+        default=None,
+        help=(
+            "If set, choose exactly this many test episodes globally. "
+            "Eligible scenes are sampled proportionally and each eligible scene gets at least one test episode."
+        ),
+    )
+    parser.add_argument(
+        "--min-test-scene-episodes",
+        type=int,
+        default=1,
+        help="With --test-count, scenes with fewer episodes than this contribute no test episodes.",
+    )
     parser.add_argument(
         "--train-ratio",
         type=float,
@@ -107,6 +122,72 @@ def materialize_split(
     return counts
 
 
+def allocate_fixed_test_counts(
+    by_scene: dict[str, list[dict[str, Any]]],
+    test_count: int,
+    min_test_scene_episodes: int,
+) -> dict[str, int]:
+    if test_count < 1:
+        raise ValueError("--test-count must be positive")
+    if min_test_scene_episodes < 1:
+        raise ValueError("--min-test-scene-episodes must be positive")
+
+    eligible = {
+        scene: episodes
+        for scene, episodes in sorted(by_scene.items())
+        if len(episodes) >= min_test_scene_episodes and len(episodes) > 1
+    }
+    if not eligible:
+        raise ValueError("No scene is eligible for test sampling")
+    if test_count < len(eligible):
+        raise ValueError(
+            f"--test-count={test_count} is too small to sample every eligible scene "
+            f"({len(eligible)} scenes)"
+        )
+
+    capacities = {scene: len(episodes) - 1 for scene, episodes in eligible.items()}
+    if test_count > sum(capacities.values()):
+        raise ValueError(
+            f"--test-count={test_count} exceeds eligible capacity "
+            f"({sum(capacities.values())}); each scene keeps at least one train episode"
+        )
+
+    allocations = {scene: 1 for scene in eligible}
+    remaining = test_count - len(eligible)
+    if remaining == 0:
+        return {scene: allocations.get(scene, 0) for scene in by_scene}
+
+    extra_capacities = {scene: capacities[scene] - 1 for scene in eligible}
+    total_extra_capacity = sum(extra_capacities.values())
+    if remaining > total_extra_capacity:
+        raise ValueError(f"Unable to allocate {test_count} test episodes with the requested constraints")
+
+    quotas = {
+        scene: remaining * extra_cap / total_extra_capacity
+        for scene, extra_cap in extra_capacities.items()
+    }
+    for scene, quota in quotas.items():
+        extra = min(extra_capacities[scene], int(quota))
+        allocations[scene] += extra
+
+    leftover = test_count - sum(allocations.values())
+    ranked = sorted(
+        eligible,
+        key=lambda scene: (-(quotas[scene] - int(quotas[scene])), -len(eligible[scene]), scene),
+    )
+    for scene in ranked:
+        if leftover <= 0:
+            break
+        if allocations[scene] >= capacities[scene]:
+            continue
+        allocations[scene] += 1
+        leftover -= 1
+    if leftover:
+        raise ValueError(f"Unable to allocate {leftover} remaining test episodes")
+
+    return {scene: allocations.get(scene, 0) for scene in by_scene}
+
+
 def main() -> int:
     args = parse_args()
     input_root = args.input_root.expanduser().resolve()
@@ -132,13 +213,23 @@ def main() -> int:
     test_episodes: list[dict[str, Any]] = []
     scene_counts: dict[str, dict[str, int]] = {}
     denominator = args.train_parts + args.test_parts
+    fixed_test_counts = None
+    if args.test_count is not None:
+        fixed_test_counts = allocate_fixed_test_counts(
+            by_scene,
+            args.test_count,
+            args.min_test_scene_episodes,
+        )
 
     for scene, scene_episodes in sorted(by_scene.items()):
         shuffled = scene_episodes.copy()
         random.Random(f"{args.seed}:{scene}").shuffle(shuffled)
-        test_count = max(1, round(len(shuffled) * args.test_parts / denominator))
-        if len(shuffled) > 1:
-            test_count = min(test_count, len(shuffled) - 1)
+        if fixed_test_counts is not None:
+            test_count = fixed_test_counts[scene]
+        else:
+            test_count = max(1, round(len(shuffled) * args.test_parts / denominator))
+            if len(shuffled) > 1:
+                test_count = min(test_count, len(shuffled) - 1)
         scene_test = sorted(shuffled[:test_count], key=lambda item: item["key"])
         scene_train = sorted(shuffled[test_count:], key=lambda item: item["key"])
         train_episodes.extend(scene_train)
@@ -160,8 +251,11 @@ def main() -> int:
         "input_root": str(input_root),
         "output_root": str(output_root),
         "seed": args.seed,
+        "split_mode": "fixed_test_count" if args.test_count is not None else "ratio",
         "train_parts": args.train_parts,
         "test_parts": args.test_parts,
+        "test_count_requested": args.test_count,
+        "min_test_scene_episodes": args.min_test_scene_episodes,
         "episode_count": len(episodes),
         "train_count": len(train_episodes),
         "test_count": len(test_episodes),

@@ -32,7 +32,7 @@ EVAL_DRONE_MIN_FOLLOW_DIST="${EVAL_DRONE_MIN_FOLLOW_DIST:-3.0}"
 # 对齐采集默认值：最近跟踪距离，单位 m
 EVAL_DRONE_MAX_FOLLOW_DIST="${EVAL_DRONE_MAX_FOLLOW_DIST:-5.5}"
 # 对齐采集默认值：最远正常跟踪距离，单位 m
-EVAL_DRONE_HEIGHT="${EVAL_DRONE_HEIGHT:-600}"
+EVAL_DRONE_HEIGHT="${EVAL_DRONE_HEIGHT:-400}"
 # 新数据实际 drone_height 分布为 500/550/600/650/700，600 是中位数；评估默认仍会优先恢复 test 首帧记录位姿。
 
 EVAL_SETTLE_STEPS="${EVAL_SETTLE_STEPS:-1}"
@@ -48,7 +48,7 @@ EVAL_TARGET_PATH_MIN_SPACING="${EVAL_TARGET_PATH_MIN_SPACING:-100}"
 EVAL_TARGET_PATH_REACH_DISTANCE="${EVAL_TARGET_PATH_REACH_DISTANCE:-120}"
 EVAL_TARGET_GOAL_REACH_DISTANCE="${EVAL_TARGET_GOAL_REACH_DISTANCE:-50}"
 EVAL_TARGET_STOP_WAIT_MIN_STEPS="${EVAL_TARGET_STOP_WAIT_MIN_STEPS:-5}"
-EVAL_TARGET_STOP_WAIT_MAX_STEPS="${EVAL_TARGET_STOP_WAIT_MAX_STEPS:-15}"
+EVAL_TARGET_STOP_WAIT_MAX_STEPS="${EVAL_TARGET_STOP_WAIT_MAX_STEPS:-5}"
 
 EVAL_WAYPOINT_INDEX="${EVAL_WAYPOINT_INDEX:-9}" # 约 0.9 秒后的累计 waypoint，用于覆盖约 1 秒推理周期
 EVAL_WAYPOINT_HORIZON_STEPS="${EVAL_WAYPOINT_HORIZON_STEPS:-9}"
@@ -58,6 +58,7 @@ EVAL_DT="${EVAL_DT:-0.1}"
 EVAL_HISTORY_FRAME_DT="${EVAL_HISTORY_FRAME_DT:-0.1}"
 EVAL_HISTORY_SAMPLING_MODE="${EVAL_HISTORY_SAMPLING_MODE:-time_grid}"
 EVAL_FPS="${EVAL_FPS:-10}"
+EVAL_DETERMINISTIC_STEP="${EVAL_DETERMINISTIC_STEP:-0}"
 EVAL_REALTIME_WAYPOINT_TIMING="${EVAL_REALTIME_WAYPOINT_TIMING:-1}"
 EVAL_REALTIME_WAYPOINT_MIN_SECONDS="${EVAL_REALTIME_WAYPOINT_MIN_SECONDS:-0.1}"
 EVAL_REALTIME_WAYPOINT_MAX_SECONDS="${EVAL_REALTIME_WAYPOINT_MAX_SECONDS:-0.9}"
@@ -65,27 +66,48 @@ EVAL_SCENES="${EVAL_SCENES:-}"
 EVAL_EPISODES="${EVAL_EPISODES:-manifest}"
 EVAL_DRONE_VX_SCALE="${EVAL_DRONE_VX_SCALE:-0.12}" # base_velocity 约 1.0m/s -> 底层 vx 命令约 0.12
 EVAL_DRONE_VY_SCALE="${EVAL_DRONE_VY_SCALE:-0.1}"  # base_velocity 约 0.5m/s -> 底层 vy 命令约 0.05
-EVAL_DRONE_YAW_SIGN="${EVAL_DRONE_YAW_SIGN:-1.0}" 
+: "${EVAL_DRONE_YAW_SIGN:=1.0}"
 EVAL_DRONE_YAW_SCALE="${EVAL_DRONE_YAW_SCALE:-1.0}"
-EVAL_DRONE_MAX_SPEED="${EVAL_DRONE_MAX_SPEED:-0.12}"
-# 对齐当前新训练集实际 commanded_base_velocity：vx<=0.12, vy<=0.05, yaw=0
-EVAL_DRONE_MAX_VX="${EVAL_DRONE_MAX_VX:-0.12}"
-EVAL_DRONE_MAX_VY="${EVAL_DRONE_MAX_VY:-0.05}"
-EVAL_DRONE_MAX_YAW_RATE="${EVAL_DRONE_MAX_YAW_RATE:-0.0}"
-# 当前训练集 drone_action[3] 基本为 0；采集时靠 snap-heading 直接对准目标
+# 对齐当前新训练集：平移映射到底层 step-like 命令，yaw 为真实可学习角速度。
+EVAL_DRONE_MAX_YAW_RATE="${EVAL_DRONE_MAX_YAW_RATE:-0.4}"
 EVAL_DRONE_SUCCESS_DISTANCE="${EVAL_DRONE_SUCCESS_DISTANCE:-5.5}" # 调：可见且距离不超过该值才算跟上
 # 默认对齐采集 max-follow-dist；如果只想放宽指标，可单独改大这个值
 EVAL_MAX_LOST_STEPS="${EVAL_MAX_LOST_STEPS:-20}" #调
 # 连续多少步没跟上就判丢失
 EVAL_MAX_EPISODE_SECONDS="${EVAL_MAX_EPISODE_SECONDS:-600.0}"
 EVAL_MIN_SUCCESS_STEPS="${EVAL_MIN_SUCCESS_STEPS:-20}"
-EVAL_SUCCESS_RATE_THRESHOLD="${EVAL_SUCCESS_RATE_THRESHOLD:-0.5}"
-EVAL_INIT_FROM_RECORDED_AGENT_POSE="${EVAL_INIT_FROM_RECORDED_AGENT_POSE:-1}"
+EVAL_SUCCESS_RATE_THRESHOLD="${EVAL_SUCCESS_RATE_THRESHOLD:-0.8}"
+EVAL_MIN_CENTERED_RATE="${EVAL_MIN_CENTERED_RATE:-0.8}"
+EVAL_INIT_FROM_RECORDED_AGENT_POSE="${EVAL_INIT_FROM_RECORDED_AGENT_POSE:-0}"
+EVAL_INIT_FOLLOWERS_BEHIND_TARGET="${EVAL_INIT_FOLLOWERS_BEHIND_TARGET:-1}"
 EVAL_FACE_TARGET_BEFORE_STEP="${EVAL_FACE_TARGET_BEFORE_STEP:-0}"
 # 是否在每步模型输入前让无人机朝向目标；1 更接近采集，0 更严格评估模型 yaw 控制
 
 
-EVAL_HUMAN_SPEED="${EVAL_HUMAN_SPEED:-90}" # 调：对齐采集默认人速，单位 Unreal units/s
+EVAL_HUMAN_SPEED="${EVAL_HUMAN_SPEED:-0.9}" # m/s; allowed: 0.9, 1.0, 1.1, 1.2
+agent_speed_for_human() {
+    case "$1" in
+        0.9|.9) echo "1.20" ;;
+        1.0|1) echo "1.35" ;;
+        1.1) echo "1.50" ;;
+        1.2) echo "1.60" ;;
+        *) echo "Unsupported EVAL_HUMAN_SPEED=$1; choose 0.9, 1.0, 1.1, or 1.2 m/s" >&2; exit 2 ;;
+    esac
+}
+agent_lateral_speed_for_human() {
+    case "$1" in
+        0.9|.9) echo "0.60" ;;
+        1.0|1) echo "0.675" ;;
+        1.1) echo "0.75" ;;
+        1.2) echo "0.80" ;;
+        *) echo "Unsupported EVAL_HUMAN_SPEED=$1; choose 0.9, 1.0, 1.1, or 1.2 m/s" >&2; exit 2 ;;
+    esac
+}
+DEFAULT_AGENT_MAX_SPEED="$(agent_speed_for_human "${EVAL_HUMAN_SPEED}")"
+DEFAULT_AGENT_LATERAL_SPEED="$(agent_lateral_speed_for_human "${EVAL_HUMAN_SPEED}")"
+EVAL_DRONE_MAX_SPEED="${EVAL_DRONE_MAX_SPEED:-${DEFAULT_AGENT_MAX_SPEED}}"
+EVAL_DRONE_MAX_VX="${EVAL_DRONE_MAX_VX:-${DEFAULT_AGENT_MAX_SPEED}}"
+EVAL_DRONE_MAX_VY="${EVAL_DRONE_MAX_VY:-${DEFAULT_AGENT_LATERAL_SPEED}}"
 EVAL_HUMAN_GOAL_MIN_DISTANCE="${EVAL_HUMAN_GOAL_MIN_DISTANCE:-700}"
 EVAL_HUMAN_GOAL_MAX_DISTANCE="${EVAL_HUMAN_GOAL_MAX_DISTANCE:-2200}"
 EVAL_OPEN_SPAWN="${EVAL_OPEN_SPAWN:-1}"
@@ -94,7 +116,7 @@ EVAL_MIN_OPEN_CLEARANCE="${EVAL_MIN_OPEN_CLEARANCE:-300}"
 EVAL_OPEN_SPAWN_CANDIDATES="${EVAL_OPEN_SPAWN_CANDIDATES:-128}"
 EVAL_GROUND_NAVMESH_TOLERANCE="${EVAL_GROUND_NAVMESH_TOLERANCE:-300}"
 EVAL_DRONE_NAVMESH_TOLERANCE="${EVAL_DRONE_NAVMESH_TOLERANCE:-800}"
-EVAL_REQUIRE_VISUAL_TARGET="${EVAL_REQUIRE_VISUAL_TARGET:-0}"
+EVAL_REQUIRE_VISUAL_TARGET="${EVAL_REQUIRE_VISUAL_TARGET:-1}"
 EVAL_REQUIRE_CENTERED_TARGET="${EVAL_REQUIRE_CENTERED_TARGET:-0}"
 EVAL_USE_MASK_VISIBILITY="${EVAL_USE_MASK_VISIBILITY:-1}"
 EVAL_MIN_VISIBLE_RATIO="${EVAL_MIN_VISIBLE_RATIO:-0.001}"
@@ -106,13 +128,14 @@ EVAL_DRONE_CAMERA_YAW_OFFSETS="${EVAL_DRONE_CAMERA_YAW_OFFSETS:-0}"
 EVAL_ROBOTDOG_CAMERA_MODE="${EVAL_ROBOTDOG_CAMERA_MODE:-fixed}"
 EVAL_DRONE_CAMERA_MODE="${EVAL_DRONE_CAMERA_MODE:-fixed}"
 EVAL_LOCK_DRONE_CAMERA_WORLD_XY="${EVAL_LOCK_DRONE_CAMERA_WORLD_XY:-1}"
-EVAL_DRONE_CAMERA_Z_OFFSET="${EVAL_DRONE_CAMERA_Z_OFFSET:-0}"
+EVAL_DRONE_CAMERA_FORWARD_OFFSET="${EVAL_DRONE_CAMERA_FORWARD_OFFSET:-35}"
+EVAL_DRONE_CAMERA_Z_OFFSET="${EVAL_DRONE_CAMERA_Z_OFFSET:--60}"
 EVAL_DRONE_FOV="${EVAL_DRONE_FOV:-100}"
 EVAL_MAX_CAMERA_SEARCH_CANDIDATES="${EVAL_MAX_CAMERA_SEARCH_CANDIDATES:-12}"
-EVAL_SNAP_HEADING="${EVAL_SNAP_HEADING:-1}"
+EVAL_SNAP_HEADING="${EVAL_SNAP_HEADING:-0}"
 EVAL_FOLLOW_BEHIND="${EVAL_FOLLOW_BEHIND:-1}"
 # 无人机训练使用实际执行速度标签；评估时通过 EVAL_DRONE_*_SCALE 映射到底层控制命令。
-ACTION_FIELD="${ACTION_FIELD:-base_velocity}"
+ACTION_FIELD="${ACTION_FIELD:-auto}"
 
 : '使用评估：
 RUN_ORGANIZE=0 RUN_SPLIT=0 RUN_PROCESS=0 RUN_CACHE=0 RUN_TRAIN=0 RUN_EVAL=1 \
@@ -228,8 +251,12 @@ run_eval() {
     follow_behind_flag="$(bool_cli_arg follow-behind "${EVAL_FOLLOW_BEHIND}")"
     local disable_ue_input_flag
     disable_ue_input_flag="$(bool_cli_arg disable-ue-input "${EVAL_DISABLE_UE_INPUT}")"
+    local deterministic_step_flag
+    deterministic_step_flag="$(bool_cli_arg deterministic-step "${EVAL_DETERMINISTIC_STEP}")"
     local init_from_recorded_agent_pose_flag
     init_from_recorded_agent_pose_flag="$(bool_cli_arg init-from-recorded-agent-pose "${EVAL_INIT_FROM_RECORDED_AGENT_POSE}")"
+    local init_followers_behind_target_flag
+    init_followers_behind_target_flag="$(bool_cli_arg init-followers-behind-target "${EVAL_INIT_FOLLOWERS_BEHIND_TARGET}")"
 
     while IFS=$'\t' read -r scene episodes waypoint_command_dt; do
         echo "[eval] scene=${scene} episodes=${episodes} waypoint_command_dt=${waypoint_command_dt}"
@@ -256,6 +283,7 @@ run_eval() {
             --history-frame-dt "${EVAL_HISTORY_FRAME_DT}" \
             --history-sampling-mode "${EVAL_HISTORY_SAMPLING_MODE}" \
             --fps "${EVAL_FPS}" \
+            "${deterministic_step_flag}" \
             "$(bool_cli_arg realtime-waypoint-timing "${EVAL_REALTIME_WAYPOINT_TIMING}")" \
             --realtime-waypoint-min-seconds "${EVAL_REALTIME_WAYPOINT_MIN_SECONDS}" \
             --realtime-waypoint-max-seconds "${EVAL_REALTIME_WAYPOINT_MAX_SECONDS}" \
@@ -275,8 +303,10 @@ run_eval() {
             --max-lost-steps "${EVAL_MAX_LOST_STEPS}" \
             --max-episode-seconds "${EVAL_MAX_EPISODE_SECONDS}" \
             --success-rate-threshold "${EVAL_SUCCESS_RATE_THRESHOLD}" \
+            --min-centered-rate "${EVAL_MIN_CENTERED_RATE}" \
             --min-success-steps "${EVAL_MIN_SUCCESS_STEPS}" \
             "${init_from_recorded_agent_pose_flag}" \
+            "${init_followers_behind_target_flag}" \
             --human-speed "${EVAL_HUMAN_SPEED}" \
             --human-goal-min-distance "${EVAL_HUMAN_GOAL_MIN_DISTANCE}" \
             --human-goal-max-distance "${EVAL_HUMAN_GOAL_MAX_DISTANCE}" \
@@ -298,6 +328,7 @@ run_eval() {
             --robotdog-camera-mode "${EVAL_ROBOTDOG_CAMERA_MODE}" \
             --drone-camera-mode "${EVAL_DRONE_CAMERA_MODE}" \
             "${lock_drone_camera_world_xy_flag}" \
+            --drone-camera-forward-offset "${EVAL_DRONE_CAMERA_FORWARD_OFFSET}" \
             --drone-camera-z-offset "${EVAL_DRONE_CAMERA_Z_OFFSET}" \
             --drone-fov "${EVAL_DRONE_FOV}" \
             --max-camera-search-candidates "${EVAL_MAX_CAMERA_SEARCH_CANDIDATES}" \

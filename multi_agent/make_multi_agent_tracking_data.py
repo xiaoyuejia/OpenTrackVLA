@@ -163,6 +163,8 @@ def episode_status_ok(
             return False
         if float(dog_rate or 0.0) < min_agent_following_rate:
             return False
+        # centered/distance rates are retained as diagnostics and are not
+        # downstream hard filters.
 
     if not only_success:
         return True
@@ -214,9 +216,8 @@ def read_image_size(path: Path, fallback_width: int, fallback_height: int) -> Tu
 def action_field_order(preferred_field: Optional[str]) -> List[str]:
     """Choose label fields.
 
-    ``auto`` uses ``base_velocity`` first. This preserves Habitat, where
-    ``base_velocity`` is the expert command, and matches current UnrealZoo
-    robotdog data where it is the executed body-frame motion.
+    Static fallback order. New UnrealZoo rows are handled in ``to_action3``
+    using their explicit command metadata.
     """
     preferred = (preferred_field or ACTION_FIELD_AUTO).strip()
     if not preferred or preferred == ACTION_FIELD_AUTO:
@@ -235,7 +236,12 @@ def to_action3(step: Dict[str, Any], agent_name: str, preferred_field: str) -> L
     没有该字段时回退到 base_velocity，从而保留 Habitat/旧数据行为。
     drone_action 是 4 维时，yaw_rate 位于第 4 个元素，因此单独处理。
     """
-    field_order = action_field_order(preferred_field)
+    if (preferred_field or ACTION_FIELD_AUTO).strip() == ACTION_FIELD_AUTO and (
+        step.get("command_label_source") or step.get("env_action") is not None
+    ):
+        field_order = ["commanded_base_velocity", "base_velocity"]
+    else:
+        field_order = action_field_order(preferred_field)
     if agent_name == "drone":
         field_order.extend(["drone_action"])
     elif agent_name == "robotdog":
@@ -559,7 +565,8 @@ def parse_args() -> argparse.Namespace:
         default=ACTION_FIELD_AUTO,
         help=(
             "Preferred action field in each *_info.json step. Default auto uses "
-            "base_velocity first and falls back to commanded_base_velocity."
+            "commanded_base_velocity for current UnrealZoo rows and base_velocity "
+            "for legacy/Habitat rows."
         ),
     )
     parser.add_argument("--instruction", type=str, default=None)
@@ -568,7 +575,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--skip_collision_steps", action="store_true")
     parser.add_argument("--require_visible", action="store_true")
     parser.add_argument("--min_target_visibility", type=float, default=0.0)
-    parser.add_argument("--min_agent_following_rate", type=float, default=0.0)
+    parser.add_argument("--min_agent_following_rate", type=float, default=0.8)
     parser.add_argument("--min_total_steps", type=int, default=0)
     parser.add_argument("--allow_partial_horizon", action="store_true")
     parser.add_argument("--ffmpeg_quality", type=int, default=2)

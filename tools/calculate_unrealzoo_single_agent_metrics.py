@@ -35,6 +35,7 @@ def main() -> int:
         "episodes": len(rows),
         "SR": mean("success") * 100.0,
         "TR": mean(following_key) * 100.0,
+        "Centered": mean("centered_rate") * 100.0,
         "CR": mean("collision") * 100.0,
         "avg_steps": mean("total_step"),
         "avg_distance": mean("avg_distance"),

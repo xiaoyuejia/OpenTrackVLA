@@ -23,9 +23,11 @@ env:
   EVAL_TARGET_PATH_MIN_SPACING: 100
   EVAL_TARGET_PATH_REACH_DISTANCE: 120
   EVAL_TARGET_GOAL_REACH_DISTANCE: 50
-  EVAL_TARGET_STOP_WAIT_MIN_STEPS: 5
-  EVAL_TARGET_STOP_WAIT_MAX_STEPS: 15
-  EVAL_HUMAN_SPEED: 90
+  EVAL_TARGET_STOP_WAIT_MIN_STEPS: 0
+  EVAL_TARGET_STOP_WAIT_MAX_STEPS: 0
+  # Default target speed is 0.9 m/s. Optional choices: 1.0, 1.1, 1.2 m/s.
+  # If changed, update agent max-speed overrides or remove them for shell defaults.
+  EVAL_HUMAN_SPEED: 0.9
   EVAL_MAX_LOST_STEPS: 20
   EVAL_MAX_EPISODE_SECONDS: 0
   EVAL_MIN_SUCCESS_STEPS: 20
@@ -35,8 +37,10 @@ env:
   EVAL_DT: 0.1
   EVAL_HISTORY_FRAME_DT: 0.1
   EVAL_FPS: 10
-  # Select the waypoint explicitly below instead of deriving it from wall time.
-  EVAL_REALTIME_WAYPOINT_TIMING: 0
+  EVAL_DETERMINISTIC_STEP: 0
+  # Realtime evaluation: UE keeps running during inference, and the command
+  # waypoint is selected from the measured observation interval.
+  EVAL_REALTIME_WAYPOINT_TIMING: 1
   EVAL_REALTIME_WAYPOINT_MIN_SECONDS: 0.1
   EVAL_REALTIME_WAYPOINT_MAX_SECONDS: 0.9
   EVAL_WAYPOINT_INDEX: 9
@@ -51,14 +55,15 @@ env:
   EVAL_DRONE_YAW_SIGN: 1.0
   # Autonomous yaw evaluation: no simulator-side target facing.
   EVAL_DRONE_YAW_SCALE: 0.8
-  EVAL_DRONE_MAX_SPEED: 0.12
-  EVAL_DRONE_MAX_VX: 0.12
-  EVAL_DRONE_MAX_VY: 0.05
+  EVAL_DRONE_MAX_SPEED: 1.20
+  EVAL_DRONE_MAX_VX: 1.20
+  EVAL_DRONE_MAX_VY: 0.60
   EVAL_DRONE_MAX_YAW_RATE: 0.8
   EVAL_DRONE_HEIGHT: 600
 
-  EVAL_INIT_FROM_RECORDED_AGENT_POSE: 1
-  EVAL_REQUIRE_VISUAL_TARGET: 0
+  EVAL_INIT_FROM_RECORDED_AGENT_POSE: 0
+  EVAL_INIT_FOLLOWERS_BEHIND_TARGET: 1
+  EVAL_REQUIRE_VISUAL_TARGET: 1
   EVAL_REQUIRE_CENTERED_TARGET: 0
   EVAL_USE_MASK_VISIBILITY: 1
   EVAL_MIN_VISIBLE_RATIO: 0.001
@@ -66,5 +71,5 @@ env:
   EVAL_FOLLOW_BEHIND: 1
   EVAL_FACE_TARGET_BEFORE_STEP: 0
   SAVE_EVAL_VIDEO: 1
-  #CONFIG_PATH=/data/hdt/newtrackvla/config/eval_drone_single_realtime_gpu1.yaml \
-  #bash sh/run_single_agent_eval_yaml.sh --overwrite
+# CONFIG_PATH=/data/hdt/newtrackvla/config/eval_drone_single_realtime_gpu1.yaml \
+# bash sh/run_single_agent_eval_yaml.sh --overwrite

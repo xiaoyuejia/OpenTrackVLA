@@ -195,7 +195,12 @@ class UnrealZooSingleAgentPlanner:
             flush=True,
         )
         self.encoder = VisionFeatureCacher(
-            VisionCacheConfig(image_size=args.image_size, batch_size=1, device=str(self.device))
+            VisionCacheConfig(
+                image_size=args.image_size,
+                batch_size=1,
+                device=str(self.device),
+                resize_mode=args.vision_resize_mode,
+            )
         ).eval()
         self.history_tokens: deque[tuple[float, torch.Tensor]] = deque(
             maxlen=max(self.history * 4, self.history + 1)
@@ -308,20 +313,13 @@ class UnrealZooSingleAgentPlanner:
             "realtime_control_period_seconds_clipped": clipped_period,
         }
         if self.args.agent == "drone":
-            vx = float(
-                np.clip(
-                    velocity[0] * float(self.args.drone_vx_scale),
-                    -self.args.drone_max_vx,
-                    self.args.drone_max_vx,
-                )
-            )
-            vy = float(
-                np.clip(
-                    velocity[1] * float(self.args.drone_vy_scale),
-                    -self.args.drone_max_vy,
-                    self.args.drone_max_vy,
-                )
-            )
+            vx_raw = float(velocity[0] * float(self.args.drone_vx_scale))
+            vy_raw = float(velocity[1] * float(self.args.drone_vy_scale))
+            if self.args.clip_translational_actions:
+                vx = float(np.clip(vx_raw, -self.args.drone_max_vx, self.args.drone_max_vx))
+                vy = float(np.clip(vy_raw, -self.args.drone_max_vy, self.args.drone_max_vy))
+            else:
+                vx, vy = vx_raw, vy_raw
             yaw_rate = float(
                 np.clip(
                     velocity[2]
@@ -337,12 +335,19 @@ class UnrealZooSingleAgentPlanner:
                 action_debug,
             )
 
-        speed = float(
-            np.clip(
-                velocity[0] * common.UNREAL_UNITS_PER_METER * float(self.args.robotdog_speed_gain),
-                -self.args.robotdog_max_speed * common.UNREAL_UNITS_PER_METER,
-                self.args.robotdog_max_speed * common.UNREAL_UNITS_PER_METER,
+        speed_raw = float(
+            velocity[0] * common.UNREAL_UNITS_PER_METER * float(self.args.robotdog_speed_gain)
+        )
+        speed = (
+            float(
+                np.clip(
+                    speed_raw,
+                    -self.args.robotdog_max_speed * common.UNREAL_UNITS_PER_METER,
+                    self.args.robotdog_max_speed * common.UNREAL_UNITS_PER_METER,
+                )
             )
+            if self.args.clip_translational_actions
+            else speed_raw
         )
         turn = float(
             np.clip(
@@ -525,7 +530,11 @@ def _target_path_waypoints(trajectory: dict[str, Any], args: argparse.Namespace)
 
 
 def start_recorded_path_navigation(env, args: argparse.Namespace, setup: dict[str, Any], trajectory: dict[str, Any]) -> None:
-    waypoints = _target_path_waypoints(trajectory, args)
+    waypoints = (
+        setup.get("target_path")
+        if setup.get("target_replay_mode") == "path_goal"
+        else None
+    ) or _target_path_waypoints(trajectory, args)
     setup["target_path_waypoints"] = waypoints
     setup["target_path_index"] = 0
     if len(waypoints) < 2:
@@ -571,23 +580,27 @@ def run_episode(
     setup = common.setup_episode(env, args, episode_id, rng, target_trajectory=trajectory)
     restored_target_initial_state = restore_recorded_target_initial_state(env, setup, trajectory)
     restored_initial_state = False
-    if args.init_from_recorded_agent_pose:
+    use_recorded_agent_pose = bool(
+        args.init_from_recorded_agent_pose
+        and not bool(getattr(args, "init_followers_behind_target", True))
+    )
+    if use_recorded_agent_pose:
         restored_initial_state = restore_recorded_agent_initial_state(env, args, setup, trajectory)
         if not restored_initial_state:
             raise common.EpisodeSkipped(
                 f"recorded Habitat-style initialization requires a first-frame {args.agent} pose"
             )
     settled_steps = settle_initial_state(env, args, setup)
+    if settled_steps > 0:
+        restored_target_initial_state = (
+            restore_recorded_target_initial_state(env, setup, trajectory)
+            or restored_target_initial_state
+        )
     flushed_initial_observation = flush_initial_observation(env, args, setup)
     if args.target_replay_mode == "path_goal":
         start_recorded_path_navigation(env, args, setup, trajectory)
     planner.reset()
-    # Keep UE live regardless of waypoint-selection policy.  Disabling
-    # realtime_waypoint_timing now means "use the configured waypoint index",
-    # not "pause the simulator".
-    env.unwrapped.unrealcv.set_global_time_dilation(1.0)
-    env.unwrapped.unrealcv.set_max_FPS(float(args.fps))
-    env.unwrapped.unrealcv.set_resume()
+    common.configure_deterministic_clock(env, args)
     frames: list[np.ndarray] = []
     infos: list[dict[str, Any]] = []
     collision = False
@@ -596,7 +609,7 @@ def run_episode(
     last_info = None
     start_time = time.time()
     # Keep evaluating after the target reaches its goal so the model must react
-    # to a stationary person, matching the Habitat 5-15 step stop window.
+    # to a stationary person for the configured stop window.
     episode_steps = args.max_steps
     agent_name = args.agent
     agent_id = setup[f"{agent_name}_id"]
@@ -651,12 +664,9 @@ def run_episode(
         input_frame, input_visibility, input_visible, input_bbox, _input_bbox_norm = agent_input
         observation_wall_time = time.monotonic()
         if previous_observation_wall_time is None:
-            # The first action has no previous observation interval. Use the
-            # longest trained horizon because it remains active until the next
-            # observation completes.
-            realtime_control_period_seconds = float(
-                args.realtime_waypoint_max_seconds
-            )
+            # Match collection: use nominal dt for the first action, then use
+            # the previous measured observation interval.
+            realtime_control_period_seconds = float(args.dt)
         else:
             # Include inference, simulator stepping, camera reads, visibility
             # checks, and rendering from the preceding control iteration.
@@ -702,8 +712,23 @@ def run_episode(
 
         actions = [None for _ in env.unwrapped.player_list]
         actions[agent_id] = agent_action
+        drone_action = agent_action if agent_name == "drone" else [0.0, 0.0, 0.0, 0.0]
+        dog_action = agent_action if agent_name == "robotdog" else [0.0, 0.0]
+        agent_pose_before_action = list(env.unwrapped.obj_poses[agent_id])
+        target_pose_before_action = list(env.unwrapped.obj_poses[setup["target_id"]])
         # 去环境执行动作并收集数据
-        _obs, _rewards, done, last_info = common.data_collection_step(env, actions)
+        if bool(getattr(args, "deterministic_step", True)):
+            _obs, _rewards, done, last_info, pulse_wall_seconds = common.deterministic_data_collection_step(
+                env,
+                args,
+                setup,
+                drone_action,
+                dog_action,
+            )
+        else:
+            pulse_t0 = time.monotonic()
+            _obs, _rewards, done, last_info = common.data_collection_step_pose_only(env, actions)
+            pulse_wall_seconds = time.monotonic() - pulse_t0
         if args.target_replay_mode == "pose" and not target_stopped:
             next_pose = trajectory["poses"][min(step_idx + 1, len(trajectory["poses"]) - 1)]
             common._set_recorded_target_pose(env, setup, next_pose)
@@ -724,6 +749,8 @@ def run_episode(
             )
             / common.UNREAL_UNITS_PER_METER
         )
+        action_pulse_displacement_m = common.distance_xy_m(agent_pose_before_action, agent_pose)
+        target_action_pulse_displacement_m = common.distance_xy_m(target_pose_before_action, target_pose)
         if agent_name == "drone":
             step_collision = common.drone_collision_from_info(
                 last_info, agent_id, setup["target_id"], distance, agent_pose, target_pose
@@ -733,7 +760,9 @@ def run_episode(
                 last_info, agent_id, setup["target_id"], distance, agent_pose, target_pose
             )
         collision = collision or step_collision
-        in_success_distance = bool(distance <= success_distance)
+        min_follow_distance = float(getattr(args, f"{agent_name}_min_follow_dist"))
+        max_follow_distance = float(getattr(args, f"{agent_name}_max_follow_dist"))
+        in_success_distance = bool(min_follow_distance <= distance <= max_follow_distance)
         following = bool(visible and (in_success_distance or not args.require_success_distance))
         if following:
             lost_count = 0
@@ -783,6 +812,7 @@ def run_episode(
             "target_visible": bool(visible),
             "target_visibility": float(visibility),
             "target_bbox": bbox,
+            "target_centered": bool(visible and common.bbox_centered(bbox, args)),
             "input_dis_to_human": float(input_distance),
             "input_target_visible": bool(input_visible),
             "input_target_visibility": float(input_visibility),
@@ -799,6 +829,11 @@ def run_episode(
             f"{agent_name}_motion_delta_m": agent_motion_delta_m,
             "base_velocity": executed_base_velocity,
             "agent_action": [float(value) for value in agent_action],
+            "action_pulse_displacement_m": float(action_pulse_displacement_m),
+            "target_action_pulse_displacement_m": float(target_action_pulse_displacement_m),
+            "action_pulse_wall_seconds": float(pulse_wall_seconds),
+            "deterministic_step": bool(getattr(args, "deterministic_step", True)),
+            "fixed_timestep_seconds": float(args.dt),
             "following": following,
             "in_success_distance": in_success_distance,
             "target_motion_step_m": target_motion_step_m,
@@ -845,6 +880,9 @@ def run_episode(
 
     total_steps = len(infos)
     following_rate = sum(int(item["following"]) for item in infos) / max(total_steps, 1)
+    centered_rate = sum(
+        int(item.get("target_centered", False)) for item in infos
+    ) / max(total_steps, 1)
     final_following = bool(infos and infos[-1]["following"])
     final_distance = float(infos[-1]["dis_to_human"]) if infos else float("inf")
     final_follow_range_ok = bool(
@@ -902,7 +940,6 @@ def run_episode(
         not collision
         and status not in {"Lost", "Collision", "Timeout"}
         and total_steps >= args.min_success_steps
-        and following_rate >= args.success_rate_threshold
         and final_following
         and (
             not args.require_final_follow_range_on_target_stop
@@ -920,6 +957,7 @@ def run_episode(
         "total_step": total_steps,
         f"{agent_name}_following_rate": float(following_rate),
         "following_rate": float(following_rate),
+        "centered_rate": float(centered_rate),
         "final_following": final_following,
         "final_follow_range_ok": final_follow_range_ok,
         "near_rate": float(near_rate),
@@ -952,12 +990,20 @@ def run_episode(
         "target_goal_reach_distance": float(args.target_goal_reach_distance),
         "target_path_waypoints": len(setup.get("target_path_waypoints") or []),
         "target_path_index_final": int(setup.get("target_path_index", 0)),
+        "target_path_sampling": setup.get("target_path_sampling"),
         "face_target_before_step": bool(args.face_target_before_step),
-        "human_speed": float(args.human_speed),
+        "human_speed": float(args.human_speed_mps),
+        "human_speed_mps": float(args.human_speed_mps),
+        "human_speed_uu_s": float(args.human_speed),
         "robotdog_speed_gain": float(args.robotdog_speed_gain),
         "robotdog_max_speed": float(args.robotdog_max_speed),
         "waypoint_index": int(args.waypoint_index),
         "waypoint_horizon_steps": int(args.waypoint_horizon_steps),
+        "action_pulse_control": bool(getattr(args, "deterministic_step", True)),
+        "deterministic_step": bool(getattr(args, "deterministic_step", True)),
+        "fixed_timestep_seconds": (
+            float(args.dt) if bool(getattr(args, "deterministic_step", True)) else None
+        ),
         "realtime_waypoint_timing": bool(args.realtime_waypoint_timing),
         "dt": float(args.dt),
         "history_frame_dt": float(planner.history_frame_dt),
@@ -968,6 +1014,8 @@ def run_episode(
             else None
         ),
         "init_from_recorded_agent_pose": bool(args.init_from_recorded_agent_pose),
+        "init_followers_behind_target": bool(getattr(args, "init_followers_behind_target", True)),
+        "init_agent_pose_policy": setup.get("init_agent_pose_policy"),
         f"restored_recorded_{agent_name}_initial_state": bool(restored_initial_state),
         "restored_recorded_target_initial_state": bool(restored_target_initial_state),
         "success_distance": success_distance,
@@ -1021,11 +1069,18 @@ def parse_args() -> argparse.Namespace:
         help="time_grid aligns history to training FPS; inference_steps reproduces legacy evaluation.",
     )
     parser.add_argument("--image-size", type=int, default=384)
+    parser.add_argument("--vision-resize-mode", choices=("letterbox", "stretch"), default="letterbox")
     parser.add_argument("--alpha-xy", type=float, default=1.0)
     parser.add_argument("--width", type=int, default=640)
     parser.add_argument("--height", type=int, default=480)
     parser.add_argument("--fps", type=int, default=10)
     parser.add_argument("--dt", type=float, default=0.1)
+    parser.add_argument(
+        "--deterministic-step",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Pause during inference and advance one fixed-timestep UE action pulse per model step; default is realtime UE.",
+    )
     parser.add_argument("--offscreen", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--time-dilation", type=int, default=-1)
     parser.add_argument("--disable-ue-input", action=argparse.BooleanOptionalAction, default=True)
@@ -1047,27 +1102,33 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--realtime-waypoint-timing",
         action=argparse.BooleanOptionalAction,
-        default=False,
+        default=True,
         help=(
-            "Keep UE running and select the waypoint nearest to this step's "
-            "measured observation-to-action inference latency."
+            "Keep UE running and select the waypoint nearest to the previous "
+            "measured observation interval, matching collection-time dt prediction."
         ),
     )
     parser.add_argument("--realtime-waypoint-min-seconds", type=float, default=0.1)
     parser.add_argument("--realtime-waypoint-max-seconds", type=float, default=0.9)
-    parser.add_argument("--drone-vx-scale", type=float, default=0.15)
+    parser.add_argument("--drone-vx-scale", type=float, default=0.12)
     parser.add_argument("--drone-vy-scale", type=float, default=0.1)
     parser.add_argument("--drone-yaw-sign", type=float, default=1.0)
     parser.add_argument("--drone-yaw-scale", type=float, default=1.0)
-    parser.add_argument("--drone-max-vx", type=float, default=0.15)
-    parser.add_argument("--drone-max-vy", type=float, default=0.05)
-    parser.add_argument("--drone-max-yaw-rate", type=float, default=0.0)
+    parser.add_argument("--drone-max-vx", type=float, default=None, help="Legacy drone vx clip in m/s. Defaults from --drone-max-speed.")
+    parser.add_argument("--drone-max-vy", type=float, default=None, help="Legacy drone vy clip in m/s. Defaults from --drone-max-speed.")
+    parser.add_argument("--drone-max-yaw-rate", type=float, default=0.4)
+    parser.add_argument(
+        "--clip-translational-actions",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Legacy compatibility switch; current collection/evaluation leaves translation unclipped.",
+    )
     parser.add_argument("--robotdog-yaw-sign", type=float, default=1.0)
     parser.add_argument("--robotdog-yaw-scale", type=float, default=1.0)
     parser.add_argument("--robotdog-speed-gain", type=float, default=1.15) # 狗的速度增益
-    parser.add_argument("--robotdog-max-speed", type=float, default=1.05)
+    parser.add_argument("--robotdog-max-speed", type=float, default=None, help="Robot dog speed limit, meters/s. Defaults from --human-speed.")
     parser.add_argument("--robotdog-max-turn-deg", type=float, default=30.0)
-    parser.add_argument("--drone-success-distance", type=float, default=4.0)
+    parser.add_argument("--drone-success-distance", type=float, default=5.5)
     parser.add_argument("--robotdog-success-distance", type=float, default=8.0)
     parser.add_argument(
         "--robotdog-lost-distance",
@@ -1087,7 +1148,8 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--max-lost-steps", type=int, default=30)
     parser.add_argument("--max-episode-seconds", type=float, default=600.0)
-    parser.add_argument("--success-rate-threshold", type=float, default=0.5)
+    parser.add_argument("--success-rate-threshold", type=float, default=0.8)
+    parser.add_argument("--min-centered-rate", type=float, default=0.8)
     parser.add_argument("--min-success-steps", type=int, default=20)
     parser.add_argument(
         "--require-final-follow-range-on-target-stop",
@@ -1107,7 +1169,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--target-replay-mode",
         choices=["nav_goal", "pose", "path_goal"],
-        default="nav_goal",
+        default="path_goal",
         help=(
             "nav_goal: use the test trajectory start/goal but let UnrealZoo animate the human; "
             "pose: set recorded target_pose every frame, which preserves XY path but makes the character slide; "
@@ -1129,10 +1191,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--init-from-recorded-agent-pose",
         action=argparse.BooleanOptionalAction,
-        default=True,
+        default=False,
         help="Initialize the selected agent pose and camera from the first frame of the test episode.",
     )
-    parser.add_argument("--human-speed", type=float, default=90.0)# 设置人的速度
+    parser.add_argument(
+        "--init-followers-behind-target",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Place the selected agent behind the target's first sampled path segment "
+            "at the midpoint of its min/max follow-distance range."
+        ),
+    )
+    parser.add_argument("--human-speed", type=float, default=0.9, choices=common.HUMAN_SPEED_CHOICES_MPS, help="Target human speed, meters/s.")
     parser.add_argument(
         "--target-goal-reach-distance",
         type=float,
@@ -1140,7 +1211,7 @@ def parse_args() -> argparse.Namespace:
         help="Final target-goal threshold in Unreal units; 50 equals Habitat's 0.5 m.",
     )
     parser.add_argument("--target-stop-wait-min-steps", type=int, default=5)
-    parser.add_argument("--target-stop-wait-max-steps", type=int, default=15)
+    parser.add_argument("--target-stop-wait-max-steps", type=int, default=5)
     parser.add_argument("--human-goal-min-distance", type=float, default=700.0)
     parser.add_argument("--human-goal-max-distance", type=float, default=2200.0)
     parser.add_argument("--open-spawn", action=argparse.BooleanOptionalAction, default=True)
@@ -1149,7 +1220,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--open-spawn-candidates", type=int, default=128)
     parser.add_argument("--ground-navmesh-tolerance", type=float, default=300.0)
     parser.add_argument("--drone-navmesh-tolerance", type=float, default=600.0)
-    parser.add_argument("--require-visual-target", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--require-visual-target", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--require-centered-target", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--use-mask-visibility", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--min-visible-ratio", type=float, default=0.001)
@@ -1158,9 +1229,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--human-appearance-max", type=int, default=18)
     parser.add_argument("--robotdog-appearance-min", type=int, default=20)
     parser.add_argument("--robotdog-appearance-max", type=int, default=33)
-    parser.add_argument("--robotdog-ideal-follow-dist", type=float, default=2.2)
-    parser.add_argument("--robotdog-min-follow-dist", type=float, default=1.0)
-    parser.add_argument("--robotdog-max-follow-dist", type=float, default=4.0)
+    parser.add_argument("--robotdog-ideal-follow-dist", type=float, default=6.25)
+    parser.add_argument("--robotdog-min-follow-dist", type=float, default=4.5)
+    parser.add_argument("--robotdog-max-follow-dist", type=float, default=8.0)
     parser.add_argument("--robotdog-max-lateral-speed", type=float, default=0.45)
     parser.add_argument("--robotdog-max-yaw-rate", type=float, default=1.0)
     parser.add_argument("--robotdog-camera-forward", type=float, default=140.0)
@@ -1173,18 +1244,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--robotdog-camera-mode", choices=["fixed", "oracle"], default="fixed")
     parser.add_argument("--robotdog-fov", type=float, default=95.0)
     parser.add_argument("--max-self-visible-ratio", type=float, default=0.015)
-    parser.add_argument("--drone-ideal-follow-dist", type=float, default=2.8)
-    parser.add_argument("--drone-min-follow-dist", type=float, default=1.5)
-    parser.add_argument("--drone-max-follow-dist", type=float, default=4.0)
-    parser.add_argument("--drone-height", type=float, default=1000.0)
-    parser.add_argument("--drone-max-speed", type=float, default=0.15)
+    parser.add_argument("--drone-ideal-follow-dist", type=float, default=4.25)
+    parser.add_argument("--drone-min-follow-dist", type=float, default=3.0)
+    parser.add_argument("--drone-max-follow-dist", type=float, default=5.5)
+    parser.add_argument("--drone-height", type=float, default=400.0)
+    parser.add_argument("--drone-max-speed", type=float, default=None, help="Drone physical speed limit, meters/s. Defaults from --human-speed.")
     parser.add_argument("--drone-camera-fixed-pitch", type=float, default=-60.0)
     parser.add_argument("--drone-camera-pitches", default="-60")
     parser.add_argument("--drone-camera-fixed-yaw", type=float, default=0.0)
     parser.add_argument("--drone-camera-yaw-offsets", default="0")
     parser.add_argument("--drone-camera-mode", choices=["fixed", "oracle"], default="fixed")
     parser.add_argument("--lock-drone-camera-world-xy", action=argparse.BooleanOptionalAction, default=True)
-    parser.add_argument("--drone-camera-z-offset", type=float, default=0.0)
+    parser.add_argument("--drone-camera-forward-offset", type=float, default=35.0)
+    parser.add_argument("--drone-camera-z-offset", type=float, default=-60.0)
     parser.add_argument("--drone-fov", type=float, default=100.0)
     parser.add_argument("--max-camera-search-candidates", type=int, default=12)
     parser.add_argument("--snap-heading", action=argparse.BooleanOptionalAction, default=False)
@@ -1195,6 +1267,23 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> int:
     args = parse_args()
+    common.normalize_speed_args(args)
+    default_agent_speed = common.agent_max_speed_for_human_speed(float(args.human_speed_mps))
+    if args.robotdog_max_speed is None:
+        args.robotdog_max_speed = default_agent_speed
+    if args.drone_max_speed is None:
+        args.drone_max_speed = default_agent_speed
+    if args.drone_max_vx is None:
+        args.drone_max_vx = float(args.drone_max_speed)
+    if args.drone_max_vy is None:
+        args.drone_max_vy = min(float(args.drone_max_speed), 0.5 * float(args.drone_max_speed))
+    print(
+        f"[speed-profile] human={args.human_speed_mps:.2f}m/s "
+        f"robotdog_max={args.robotdog_max_speed:.2f}m/s drone_max={args.drone_max_speed:.2f}m/s",
+        flush=True,
+    )
+    if args.realtime_waypoint_timing and bool(getattr(args, "deterministic_step", True)):
+        raise ValueError("--realtime-waypoint-timing requires --no-deterministic-step")
     if args.realtime_waypoint_min_seconds <= 0.0:
         raise ValueError("--realtime-waypoint-min-seconds must be positive")
     if args.realtime_waypoint_max_seconds < args.realtime_waypoint_min_seconds:

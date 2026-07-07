@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 from dataclasses import dataclass
-from typing import List, Dict, Any, Optional, Sequence, Tuple
+from typing import List, Dict, Any, Optional, Tuple
 import os
 import json
 import math
@@ -14,9 +14,6 @@ import torch.nn as nn
 from transformers import AutoImageProcessor, AutoModel
 from transformers import SiglipVisionModel, SiglipImageProcessor
 from PIL import Image
-
-
-ROI_SCHEMA_VERSION = "roi_tokens_v1"
 
 # ModelScope support - try to import, fallback gracefully
 try:
@@ -43,159 +40,6 @@ def _sqrt_int(n: int) -> int:
     if r * r != n:
         raise ValueError(f"{n} is not a perfect square; can't form a square grid")
     return r
-
-
-def _as_float_bbox(bbox: Any) -> Optional[Tuple[float, float, float, float]]:
-    if isinstance(bbox, torch.Tensor):
-        bbox = bbox.detach().cpu().flatten().tolist()
-    elif hasattr(bbox, "tolist") and not isinstance(bbox, (list, tuple)):
-        try:
-            bbox = bbox.tolist()
-        except Exception:
-            pass
-    if not isinstance(bbox, (list, tuple)) or len(bbox) < 4:
-        return None
-    try:
-        vals = tuple(float(v) for v in bbox[:4])
-    except Exception:
-        return None
-    if any(not math.isfinite(v) for v in vals):
-        return None
-    return vals  # type: ignore[return-value]
-
-
-def _center_square_fallback(image: Image.Image) -> Tuple[Image.Image, bool, Tuple[int, int, int, int]]:
-    width, height = image.size
-    side = max(1, min(width, height))
-    x1 = max(0, (width - side) // 2)
-    y1 = max(0, (height - side) // 2)
-    x2 = min(width, x1 + side)
-    y2 = min(height, y1 + side)
-    return image.crop((x1, y1, x2, y2)), False, (int(x1), int(y1), int(x2), int(y2))
-
-
-def crop_target_roi(
-    image: Image.Image,
-    bbox: Any,
-    bbox_format: str,
-    expand_ratio: float = 1.5,
-    make_square: bool = True,
-    min_crop_size: int = 8,
-) -> Tuple[Image.Image, bool, Tuple[int, int, int, int]]:
-    """Crop target-person ROI from an image.
-
-    ``roi_bbox`` is used only for image cropping. It is deliberately separate
-    from model ``bbox_feat`` numeric inputs, which may be disabled.
-    """
-    if not isinstance(image, Image.Image):
-        raise TypeError("image must be a PIL.Image.Image")
-    width, height = image.size
-    if width <= 0 or height <= 0:
-        raise ValueError(f"invalid image size: {image.size}")
-
-    vals = _as_float_bbox(bbox)
-    if vals is None:
-        return _center_square_fallback(image)
-    a, b, c, d = vals
-    if abs(a) + abs(b) + abs(c) + abs(d) <= 1e-12 or c <= 0.0 or d <= 0.0:
-        return _center_square_fallback(image)
-
-    fmt = str(bbox_format or "").strip().lower()
-    if fmt == "cxcywh_norm":
-        cx = a * width
-        cy = b * height
-        bw = c * width
-        bh = d * height
-    elif fmt == "xywh_pixel":
-        cx = a + 0.5 * c
-        cy = b + 0.5 * d
-        bw = c
-        bh = d
-    else:
-        raise ValueError(f"Unsupported bbox_format={bbox_format!r}")
-
-    if any(not math.isfinite(v) for v in (cx, cy, bw, bh)) or bw <= 0.0 or bh <= 0.0:
-        return _center_square_fallback(image)
-
-    ratio = max(float(expand_ratio), 1e-6)
-    crop_w = bw * ratio
-    crop_h = bh * ratio
-    if make_square:
-        side = max(crop_w, crop_h)
-        crop_w = crop_h = side
-
-    x1 = cx - 0.5 * crop_w
-    y1 = cy - 0.5 * crop_h
-    x2 = cx + 0.5 * crop_w
-    y2 = cy + 0.5 * crop_h
-    x1_i = int(math.floor(max(0.0, min(float(width), x1))))
-    y1_i = int(math.floor(max(0.0, min(float(height), y1))))
-    x2_i = int(math.ceil(max(0.0, min(float(width), x2))))
-    y2_i = int(math.ceil(max(0.0, min(float(height), y2))))
-
-    if x2_i - x1_i < int(min_crop_size) or y2_i - y1_i < int(min_crop_size):
-        return _center_square_fallback(image)
-    return image.crop((x1_i, y1_i, x2_i, y2_i)), True, (x1_i, y1_i, x2_i, y2_i)
-
-
-def build_roi_cache_payload(
-    tokens: torch.Tensor,
-    roi_token_count: int,
-    roi_expand_ratio: float,
-    roi_make_square: bool,
-    bbox_format: str,
-    roi_valid: bool,
-    crop_xyxy: Sequence[int],
-    save_float32: bool = False,
-) -> Dict[str, Any]:
-    obj = tokens.float() if save_float32 else tokens.half()
-    return {
-        "tokens": obj,
-        "schema_version": ROI_SCHEMA_VERSION,
-        "roi_token_count": int(roi_token_count),
-        "roi_expand_ratio": float(roi_expand_ratio),
-        "roi_make_square": bool(roi_make_square),
-        "bbox_format": str(bbox_format),
-        "roi_valid": bool(roi_valid),
-        "crop_xyxy": [int(v) for v in crop_xyxy],
-    }
-
-
-def roi_cache_matches(
-    payload: Any,
-    roi_token_count: int,
-    roi_expand_ratio: float,
-    roi_make_square: bool,
-) -> bool:
-    if not isinstance(payload, dict):
-        return False
-    if payload.get("schema_version") != ROI_SCHEMA_VERSION:
-        return False
-    if int(payload.get("roi_token_count", -1)) != int(roi_token_count):
-        return False
-    if abs(float(payload.get("roi_expand_ratio", -1.0)) - float(roi_expand_ratio)) > 1e-6:
-        return False
-    if bool(payload.get("roi_make_square", not roi_make_square)) != bool(roi_make_square):
-        return False
-    return isinstance(payload.get("tokens"), torch.Tensor)
-
-
-def load_roi_cache(
-    path: Path,
-    roi_token_count: int,
-    roi_expand_ratio: float,
-    roi_make_square: bool,
-) -> Dict[str, Any]:
-    payload = torch.load(str(path), map_location="cpu")
-    if not roi_cache_matches(payload, roi_token_count, roi_expand_ratio, roi_make_square):
-        raise ValueError(
-            f"ROI cache config mismatch for {path}: expected "
-            f"schema={ROI_SCHEMA_VERSION} tokens={roi_token_count} "
-            f"expand={roi_expand_ratio} square={roi_make_square}"
-        )
-    payload = dict(payload)
-    payload["tokens"] = payload["tokens"].float()
-    return payload
 
 
 def _list_image_files(dir_path: Path) -> List[Path]:
@@ -538,15 +382,6 @@ class VisionFeatureCacher(nn.Module):
         # Pool SigLIP grid (Hs×Hs) to target DINO grid (Hp×Wp)
         tok = adapt_siglip_grid(tok, grid_hw=(Hs, Hs), out_hw=out_hw)
         return tok
-
-    @torch.inference_mode()
-    def encode_pooled_tokens(self, pil_list: List[Image.Image], out_tokens: int) -> torch.Tensor:
-        """Encode images with the shared DINOv3+SigLIP towers and grid-pool tokens."""
-        _sqrt_int(int(out_tokens))
-        tok_dino, hp, wp = self._encode_dino(pil_list)
-        tok_sigl = self._encode_siglip(pil_list, out_hw=(hp, wp))
-        tokens = torch.cat([tok_dino, tok_sigl], dim=-1)
-        return grid_pool_tokens(tokens, hp, wp, out_tokens=int(out_tokens))
 
     # ---------------------------------------
     # Public API

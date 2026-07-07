@@ -69,16 +69,36 @@ DRONE_WAYPOINT_INDEX="${DRONE_WAYPOINT_INDEX:-9}"
 ROBOTDOG_WAYPOINT_INDEX="${ROBOTDOG_WAYPOINT_INDEX:-5}"
 
 # 参考当前单 Agent 评估的人速设置；各 Agent 自身限制单独控制。
-HUMAN_SPEED="${HUMAN_SPEED:-90}"
-ROBOTDOG_MAX_SPEED="${ROBOTDOG_MAX_SPEED:-1.05}"
+HUMAN_SPEED="${HUMAN_SPEED:-0.9}"  # m/s; allowed: 0.9, 1.0, 1.1, 1.2
+agent_speed_for_human() {
+    case "$1" in
+        0.9|.9) echo "1.20" ;;
+        1.0|1) echo "1.35" ;;
+        1.1) echo "1.50" ;;
+        1.2) echo "1.60" ;;
+        *) echo "Unsupported HUMAN_SPEED=$1; choose 0.9, 1.0, 1.1, or 1.2 m/s" >&2; exit 2 ;;
+    esac
+}
+agent_lateral_speed_for_human() {
+    case "$1" in
+        0.9|.9) echo "0.60" ;;
+        1.0|1) echo "0.675" ;;
+        1.1) echo "0.75" ;;
+        1.2) echo "0.80" ;;
+        *) echo "Unsupported HUMAN_SPEED=$1; choose 0.9, 1.0, 1.1, or 1.2 m/s" >&2; exit 2 ;;
+    esac
+}
+DEFAULT_AGENT_MAX_SPEED="$(agent_speed_for_human "${HUMAN_SPEED}")"
+DEFAULT_AGENT_LATERAL_SPEED="$(agent_lateral_speed_for_human "${HUMAN_SPEED}")"
+ROBOTDOG_MAX_SPEED="${ROBOTDOG_MAX_SPEED:-${DEFAULT_AGENT_MAX_SPEED}}"
 ROBOTDOG_MAX_TURN_DEG="${ROBOTDOG_MAX_TURN_DEG:-30}"
 ROBOTDOG_SUCCESS_DISTANCE="${ROBOTDOG_SUCCESS_DISTANCE:-8.0}"
 ROBOTDOG_LOST_DISTANCE="${ROBOTDOG_LOST_DISTANCE:-8.0}"
 ROBOTDOG_YAW_SIGN="${ROBOTDOG_YAW_SIGN:-1.0}"
 
-DRONE_MAX_VX="${DRONE_MAX_VX:-0.12}"
-DRONE_MAX_VY="${DRONE_MAX_VY:-0.05}"
-DRONE_MAX_YAW_RATE="${DRONE_MAX_YAW_RATE:-0.0}"
+DRONE_MAX_VX="${DRONE_MAX_VX:-${DEFAULT_AGENT_MAX_SPEED}}"
+DRONE_MAX_VY="${DRONE_MAX_VY:-${DEFAULT_AGENT_LATERAL_SPEED}}"
+DRONE_MAX_YAW_RATE="${DRONE_MAX_YAW_RATE:-0.4}"
 DRONE_VX_SCALE="${DRONE_VX_SCALE:-0.12}"
 DRONE_VY_SCALE="${DRONE_VY_SCALE:-0.1}"
 DRONE_YAW_SIGN="${DRONE_YAW_SIGN:-1.0}"
@@ -86,7 +106,8 @@ DRONE_SUCCESS_DISTANCE="${DRONE_SUCCESS_DISTANCE:-5.5}"
 DRONE_LOST_DISTANCE="${DRONE_LOST_DISTANCE:-5.5}"
 
 # 成功规则：联合跟踪率达到阈值、无碰撞且至少运行 MIN_SUCCESS_STEPS。
-SUCCESS_RATE_THRESHOLD="${SUCCESS_RATE_THRESHOLD:-0.5}"
+SUCCESS_RATE_THRESHOLD="${SUCCESS_RATE_THRESHOLD:-0.8}"
+MIN_CENTERED_RATE="${MIN_CENTERED_RATE:-0.8}"
 MIN_SUCCESS_STEPS="${MIN_SUCCESS_STEPS:-20}"
 
 # 每步在线执行 DINO + SigLIP；关闭视频可以减少编码之外的磁盘开销。
@@ -152,7 +173,7 @@ echo "Episode timeout:  ${MAX_EPISODE_SECONDS}s"
 echo "Save path:        ${SAVE_PATH}"
 echo "Waypoint index:   shared=${WAYPOINT_INDEX} drone=${DRONE_WAYPOINT_INDEX} robotdog=${ROBOTDOG_WAYPOINT_INDEX}"
 echo "DT:               ${DT}"
-echo "Human speed:      ${HUMAN_SPEED}"
+echo "Human speed:      ${HUMAN_SPEED} m/s"
 echo "RobotDog:         max_speed=${ROBOTDOG_MAX_SPEED}m/s max_turn=${ROBOTDOG_MAX_TURN_DEG}deg success=${ROBOTDOG_SUCCESS_DISTANCE}m lost=${ROBOTDOG_LOST_DISTANCE}m yaw_sign=${ROBOTDOG_YAW_SIGN}"
 echo "Drone:            max_vx=${DRONE_MAX_VX} max_vy=${DRONE_MAX_VY} max_yaw_rate=${DRONE_MAX_YAW_RATE} vx_scale=${DRONE_VX_SCALE} vy_scale=${DRONE_VY_SCALE} yaw_sign=${DRONE_YAW_SIGN} success=${DRONE_SUCCESS_DISTANCE}m lost=${DRONE_LOST_DISTANCE}m"
 echo "BBox source:      ${BBOX_SOURCE}"
@@ -201,6 +222,7 @@ PYTHONPATH="${REPO_ROOT}/unrealzoo-gym:${PYTHONPATH:-}" \
     --bbox-source "${BBOX_SOURCE}" \
     --trajectory-scale "${TRAJECTORY_SCALE}" \
     --success-rate-threshold "${SUCCESS_RATE_THRESHOLD}" \
+    --min-centered-rate "${MIN_CENTERED_RATE}" \
     --min-success-steps "${MIN_SUCCESS_STEPS}" \
     "${SAVE_VIDEO_FLAG}" \
     "${GLOBAL_VIDEO_FLAG}" \

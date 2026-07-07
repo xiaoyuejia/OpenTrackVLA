@@ -49,15 +49,7 @@ from torch.utils.data import Dataset, DataLoader
 import torch.distributed as dist
 
 from transformers import AutoTokenizer, AutoModel
-from tools.cache_gridpool import (
-    VisionFeatureCacher,
-    VisionCacheConfig,
-    build_roi_cache_payload,
-    crop_target_roi,
-    grid_pool_tokens,
-    load_roi_cache,
-    adapt_siglip_grid,
-)
+from tools.cache_gridpool import VisionFeatureCacher, VisionCacheConfig, grid_pool_tokens, adapt_siglip_grid
 from tqdm import tqdm
 
 
@@ -1890,11 +1882,6 @@ class MultiAgentDataConfig:
     online_encode_missing: bool = False
     image_size: int = 384
     vision_resize_mode: str = "letterbox"
-    use_roi_tokens: bool = False
-    roi_token_count: int = 16
-    roi_expand_ratio: float = 1.5
-    roi_make_square: bool = True
-    roi_bbox_source: str = "ground_truth"
     coarse_cache_size: int = 0
 
 
@@ -1912,9 +1899,6 @@ class MultiAgentJsonDataset(Dataset):
     - coarse_tidx:   (2, history*4)
     - fine_tokens:   (2, 64, C)
     - fine_tidx:     (2, 64)
-    - roi_tokens:    (2, roi_token_count, C), only when use_roi_tokens=True
-    - roi_tidx:      (2, roi_token_count), only when use_roi_tokens=True
-    - roi_valid:     (2,), only when use_roi_tokens=True
     - bbox_feat:     (2, 4)
     - relative_pose: (2, 5)
     - waypoints:     (2, n_waypoints, 3)
@@ -2015,29 +1999,6 @@ class MultiAgentJsonDataset(Dataset):
         vcoarse = grid_pool_tokens(tokens, hp, wp, out_tokens=4)
         return vcoarse[0].cpu().float(), vfine[0].cpu().float()
 
-    @torch.inference_mode()
-    def _encode_roi_tokens(
-        self,
-        img_path: Path,
-        bbox: Any,
-        bbox_format: str,
-    ) -> Tuple[torch.Tensor, bool, Tuple[int, int, int, int]]:
-        enc = self._get_online_encoder()
-        with Image.open(str(img_path)) as img:
-            pil = img.convert("RGB")
-        roi_img, roi_valid, crop_xyxy = crop_target_roi(
-            pil,
-            bbox,
-            bbox_format,
-            expand_ratio=float(self.cfg.roi_expand_ratio),
-            make_square=bool(self.cfg.roi_make_square),
-        )
-        try:
-            tokens = enc.encode_pooled_tokens([roi_img], int(self.cfg.roi_token_count))[0].cpu().float()
-        finally:
-            roi_img.close()
-        return tokens, bool(roi_valid), crop_xyxy
-
     def _load_or_encode_tokens(self, frame_path: Path, fine: bool) -> torch.Tensor:
         """优先读取 vision_cache，必要时在线编码并回写。
 
@@ -2075,65 +2036,6 @@ class MultiAgentJsonDataset(Dataset):
             while len(self._coarse_token_cache) > self.cfg.coarse_cache_size:
                 self._coarse_token_cache.popitem(last=False)
         return tokens
-
-    def _roi_cache_path_for_frame(self, frame_path: Path) -> Path:
-        _vc_path, vf_path = multi_agent_token_paths_for_frame(self.base_root, self.cache_root, frame_path)
-        return vf_path.with_name(f"{vf_path.name[:-len('_vfine.pt')]}_vroi.pt")
-
-    def _agent_roi_bbox(self, ex: Dict[str, Any], agent_idx: int) -> Tuple[Any, str]:
-        if str(self.cfg.roi_bbox_source) != "ground_truth":
-            raise NotImplementedError(
-                f"roi_bbox_source={self.cfg.roi_bbox_source!r} is not implemented; "
-                "currently only ground_truth oracle ROI is supported."
-            )
-        prefix = f"agent{agent_idx}_"
-        bbox = ex.get(prefix + "bbox")
-        if bbox is None:
-            order = ex.get("agent_order", [ex.get("agent1_name", "drone"), ex.get("agent2_name", "robotdog")])
-            agents = ex.get("agents", {})
-            name = order[agent_idx - 1] if isinstance(order, list) and len(order) >= agent_idx else f"agent{agent_idx}"
-            payload = agents.get(name, {}) if isinstance(agents, dict) else {}
-            bbox = payload.get("bbox")
-        return bbox, "cxcywh_norm"
-
-    def _load_agent_roi_tokens(self, ex: Dict[str, Any], agent_idx: int, current_path: Path) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        bbox, bbox_format = self._agent_roi_bbox(ex, agent_idx)
-        roi_path = self._roi_cache_path_for_frame(current_path)
-        try:
-            payload = load_roi_cache(
-                roi_path,
-                roi_token_count=int(self.cfg.roi_token_count),
-                roi_expand_ratio=float(self.cfg.roi_expand_ratio),
-                roi_make_square=bool(self.cfg.roi_make_square),
-            )
-            tokens = payload["tokens"].float()
-            roi_valid = bool(payload.get("roi_valid", False))
-        except Exception as exc:
-            if not self.cfg.online_encode_missing:
-                raise FileNotFoundError(
-                    f"Missing or incompatible ROI token cache: {roi_path}. "
-                    "Run `python -m tools.precache_frames --multi_agent --with_roi` "
-                    "with matching roi_token_count/roi_expand_ratio/roi_make_square."
-                ) from exc
-            tokens, roi_valid, crop_xyxy = self._encode_roi_tokens(current_path, bbox, bbox_format)
-            roi_path.parent.mkdir(parents=True, exist_ok=True)
-            payload = build_roi_cache_payload(
-                tokens,
-                roi_token_count=int(self.cfg.roi_token_count),
-                roi_expand_ratio=float(self.cfg.roi_expand_ratio),
-                roi_make_square=bool(self.cfg.roi_make_square),
-                bbox_format=bbox_format,
-                roi_valid=bool(roi_valid),
-                crop_xyxy=crop_xyxy,
-            )
-            torch.save(payload, str(roi_path))
-        if tokens.size(0) != int(self.cfg.roi_token_count):
-            raise ValueError(
-                f"ROI token count mismatch for {roi_path}: got {tokens.size(0)}, "
-                f"expected {self.cfg.roi_token_count}"
-            )
-        roi_tidx = torch.full((tokens.size(0),), fill_value=int(self.cfg.history), dtype=torch.long)
-        return tokens.float(), roi_tidx, torch.tensor(bool(roi_valid), dtype=torch.bool)
 
     def _load_agent_tokens(self, ex: Dict[str, Any], agent_idx: int) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, str]:
         """读取一个 Agent 的历史粗 token 和当前细 token。
@@ -2263,7 +2165,7 @@ class MultiAgentJsonDataset(Dataset):
         relative_pose, relative_pose_valid = self._load_relative_pose(ex)
         history = int(self.cfg.history)
 
-        sample = {
+        return {
             "coarse_tokens": torch.stack([a1[0], a2[0]], dim=0),
             "coarse_tidx": torch.stack([a1[1], a2[1]], dim=0),
             "fine_tokens": torch.stack([a1[2], a2[2]], dim=0),
@@ -2282,17 +2184,6 @@ class MultiAgentJsonDataset(Dataset):
             "step_index": int(ex.get("step_index", idx)),
             "current_path": [a1[4], a2[4]],
         }
-        if self.cfg.use_roi_tokens:
-            r1 = self._load_agent_roi_tokens(ex, 1, Path(a1[4]))
-            r2 = self._load_agent_roi_tokens(ex, 2, Path(a2[4]))
-            sample.update(
-                {
-                    "roi_tokens": torch.stack([r1[0], r2[0]], dim=0),
-                    "roi_tidx": torch.stack([r1[1], r2[1]], dim=0),
-                    "roi_valid": torch.stack([r1[2], r2[2]], dim=0),
-                }
-            )
-        return sample
 
 
 # ----------------------- 双 Agent batch 与数据检查 -----------------------
@@ -2302,7 +2193,7 @@ def collate_multi_agent_batch(batch: List[Dict[str, Any]]) -> Dict[str, Any]:
 
     张量字段 stack；instruction/current_path/episode_id 保留 Python list 给 tokenizer 和日志使用。
     """
-    out = {
+    return {
         "coarse_tokens": torch.stack([b["coarse_tokens"] for b in batch], dim=0),
         "coarse_tidx": torch.stack([b["coarse_tidx"] for b in batch], dim=0),
         "fine_tokens": torch.stack([b["fine_tokens"] for b in batch], dim=0),
@@ -2321,11 +2212,6 @@ def collate_multi_agent_batch(batch: List[Dict[str, Any]]) -> Dict[str, Any]:
         "step_index": torch.tensor([b["step_index"] for b in batch], dtype=torch.long),
         "current_path": [b["current_path"] for b in batch],
     }
-    if "roi_tokens" in batch[0]:
-        out["roi_tokens"] = torch.stack([b["roi_tokens"] for b in batch], dim=0)
-        out["roi_tidx"] = torch.stack([b["roi_tidx"] for b in batch], dim=0)
-        out["roi_valid"] = torch.stack([b["roi_valid"] for b in batch], dim=0)
-    return out
 
 
 def multi_agent_dataset_sanity_report(ds: MultiAgentJsonDataset, cfg: "MultiAgentTrainConfig", max_items: int = 256) -> None:
@@ -2401,11 +2287,6 @@ class MultiAgentTrainConfig:
     online_encode_missing: bool = False
     image_size: int = 384
     vision_resize_mode: str = "letterbox"
-    use_roi_tokens: bool = False
-    roi_token_count: int = 16
-    roi_expand_ratio: float = 1.5
-    roi_make_square: bool = True
-    roi_bbox_source: str = "ground_truth"
     epochs: int = 1
     batch_size: int = 2
     grad_accum_steps: int = 1
@@ -2490,21 +2371,6 @@ def apply_multi_agent_base_defaults(cfg: MultiAgentTrainConfig) -> MultiAgentTra
         cfg.base_model = True
         if not cfg.use_agent_text_markers:
             raise ValueError("--no-agent-text-markers is only supported by the shared-context base model.")
-    if cfg.use_roi_tokens:
-        side = int(round(math.sqrt(int(cfg.roi_token_count))))
-        if side * side != int(cfg.roi_token_count):
-            raise ValueError("--roi_token_count must be a perfect square.")
-        if cfg.roi_bbox_source != "ground_truth":
-            raise NotImplementedError("Only --roi_bbox_source ground_truth is implemented for oracle ROI.")
-        cfg.base_model = True
-        cfg.use_grounding = False
-        cfg.use_bbox_tokens = False
-        cfg.beta_bbox = 0.0
-        cfg.beta_visible = 0.0
-        cfg.beta_relative_pose = 0.0
-        cfg.bbox_dropout_prob = 0.0
-        cfg.return_token_logits = False
-        cfg.val_bbox_source = "none"
     if not cfg.base_model:
         return cfg
     cfg.use_grounding = False
@@ -2546,11 +2412,6 @@ def build_multi_agent_dataset(
             online_encode_missing=cfg.online_encode_missing,
             image_size=cfg.image_size,
             vision_resize_mode=cfg.vision_resize_mode,
-            use_roi_tokens=cfg.use_roi_tokens,
-            roi_token_count=cfg.roi_token_count,
-            roi_expand_ratio=cfg.roi_expand_ratio,
-            roi_make_square=cfg.roi_make_square,
-            roi_bbox_source=cfg.roi_bbox_source,
             coarse_cache_size=cfg.coarse_cache_size,
         )
     )
@@ -2580,8 +2441,6 @@ def build_multi_agent_model(cfg: MultiAgentTrainConfig) -> nn.Module:
         use_bbox_tokens=cfg.use_bbox_tokens,
         return_token_logits=cfg.return_token_logits,
         use_agent_text_markers=cfg.use_agent_text_markers,
-        use_roi_tokens=cfg.use_roi_tokens,
-        roi_token_count=cfg.roi_token_count,
     )
     model_cls = MultiAgentSeparateOpenTrackVLA if cfg.separate_agent_context else MultiAgentOpenTrackVLA
     return model_cls(model_cfg, vision_feat_dim=cfg.vision_feat_dim)
@@ -2605,12 +2464,7 @@ def forward_multi_agent_loss(
     非 base 模式仍可额外打开 bbox/visibility/relative_pose 辅助监督。
     """
     bbox_target = batch["bbox_feat"].to(device)
-    bbox_input = None if cfg.use_roi_tokens else bbox_target
-    if cfg.use_roi_tokens:
-        model_inspect_for_assert = model.module if isinstance(model, torch.nn.parallel.DistributedDataParallel) else model
-        assert getattr(model_inspect_for_assert.cfg, "use_bbox_tokens", False) is False
-        assert getattr(model_inspect_for_assert.cfg, "use_grounding", False) is False
-        assert bbox_input is None
+    bbox_input = bbox_target
     if model.training and cfg.bbox_dropout_prob > 0.0 and torch.rand((), device=device).item() < cfg.bbox_dropout_prob:
         # Entire batches alternate between bbox refinement and prior-free
         # absolute detection because the model uses a single grounding mode.
@@ -2633,15 +2487,6 @@ def forward_multi_agent_loss(
         else None
     )
 
-    roi_tokens = roi_tidx = roi_valid = None
-    if cfg.use_roi_tokens:
-        missing_roi = [key for key in ("roi_tokens", "roi_tidx", "roi_valid") if key not in batch]
-        if missing_roi:
-            raise KeyError(f"Missing ROI batch fields {missing_roi}; rerun precache with --with_roi.")
-        roi_tokens = batch["roi_tokens"].to(device)
-        roi_tidx = batch["roi_tidx"].to(device)
-        roi_valid = batch["roi_valid"].to(device)
-
     out = model(
         coarse_tokens=batch["coarse_tokens"].to(device),
         coarse_tidx=batch["coarse_tidx"].to(device),
@@ -2652,9 +2497,6 @@ def forward_multi_agent_loss(
         agent1_instructions=agent1_instructions,
         agent2_instructions=agent2_instructions,
         bbox_feat=bbox_input,
-        roi_tokens=roi_tokens,
-        roi_tidx=roi_tidx,
-        roi_valid=roi_valid,
         yaw_hist=batch["yaw_hist"].to(device) if cfg.use_angle_tvi else None,
         yaw_curr=batch["yaw_curr"].to(device) if cfg.use_angle_tvi else None,
     )
@@ -2706,26 +2548,20 @@ def forward_multi_agent_loss(
     ) / agent_loss_divisor
 
     refined_bbox = out.get("refined_bbox")
-    if cfg.use_roi_tokens:
-        loss_bbox = loss_nav.new_tensor(0.0)
-    elif cfg.beta_bbox != 0.0 and refined_bbox is not None:
+    if cfg.beta_bbox != 0.0 and refined_bbox is not None:
         loss_bbox = F.mse_loss(refined_bbox.float(), bbox_target.float())
     else:
         loss_bbox = loss_nav.new_tensor(0.0)
 
     visible_logits = out.get("visible_logits")
-    if cfg.use_roi_tokens:
-        loss_visible = loss_nav.new_tensor(0.0)
-    elif cfg.beta_visible != 0.0 and visible_logits is not None:
+    if cfg.beta_visible != 0.0 and visible_logits is not None:
         visible_target = batch["visible"].to(device)
         loss_visible = F.binary_cross_entropy_with_logits(visible_logits.float(), visible_target.float())
     else:
         loss_visible = loss_nav.new_tensor(0.0)
 
     pred_relative_pose = out.get("relative_pose")
-    if cfg.use_roi_tokens:
-        loss_relative_pose = loss_nav.new_tensor(0.0)
-    elif cfg.beta_relative_pose != 0.0 and pred_relative_pose is not None:
+    if cfg.beta_relative_pose != 0.0 and pred_relative_pose is not None:
         relative_target = batch["relative_pose"].to(device).float()
         relative_valid = batch["relative_pose_valid"].to(device).bool()
         pose_per_agent = F.smooth_l1_loss(
@@ -2835,17 +2671,6 @@ def save_multi_agent_checkpoint(
     """保存双 Agent 训练状态，兼容 DDP/单卡加载。"""
     path.parent.mkdir(parents=True, exist_ok=True)
     model_to_save = model.module if isinstance(model, torch.nn.parallel.DistributedDataParallel) else model
-    config_payload = {
-        **cfg.__dict__,
-        "model_type": multi_agent_model_type_name(cfg),
-        "visual_layout_version": "global_plus_current_roi_v1" if cfg.use_roi_tokens else "global_only_v1",
-        "evaluation_protocol": "oracle_roi_upper_bound" if cfg.use_roi_tokens else None,
-        "bbox_usage_note": (
-            "roi_bbox is used only for image cropping; bbox_feat numeric model input is disabled."
-            if cfg.use_roi_tokens
-            else None
-        ),
-    }
     torch.save(
         {
             "epoch": epoch,
@@ -2854,7 +2679,10 @@ def save_multi_agent_checkpoint(
             "optim_state": optim.state_dict(),
             "scheduler_state": scheduler.state_dict() if scheduler is not None else None,
             "scaler_state": scaler.state_dict() if scaler.is_enabled() else None,
-            "config": config_payload,
+            "config": {
+                **cfg.__dict__,
+                "model_type": multi_agent_model_type_name(cfg),
+            },
         },
         str(path),
     )
@@ -2875,13 +2703,6 @@ def write_multi_agent_train_config(out_dir: Path, cfg: MultiAgentTrainConfig) ->
     data = {
         **cfg.__dict__,
         "model_type": multi_agent_model_type_name(cfg),
-        "visual_layout_version": "global_plus_current_roi_v1" if cfg.use_roi_tokens else "global_only_v1",
-        "evaluation_protocol": "oracle_roi_upper_bound" if cfg.use_roi_tokens else None,
-        "bbox_usage_note": (
-            "roi_bbox is used only for image cropping; bbox_feat numeric model input is disabled."
-            if cfg.use_roi_tokens
-            else None
-        ),
         "effective_batch_per_rank": int(cfg.batch_size) * max(1, int(cfg.grad_accum_steps)),
     }
     (out_dir / "train_config.json").write_text(
@@ -2923,14 +2744,6 @@ def write_multi_agent_train_config(out_dir: Path, cfg: MultiAgentTrainConfig) ->
         f"no_tanh_actions: {cfg.no_tanh_actions}",
         f"use_grounding: {cfg.use_grounding}",
         f"use_bbox_tokens: {cfg.use_bbox_tokens}",
-        f"use_roi_tokens: {cfg.use_roi_tokens}",
-        f"roi_token_count: {cfg.roi_token_count}",
-        f"roi_expand_ratio: {cfg.roi_expand_ratio}",
-        f"roi_make_square: {cfg.roi_make_square}",
-        f"roi_bbox_source: {cfg.roi_bbox_source}",
-        f"visual_layout_version: {data['visual_layout_version']}",
-        f"evaluation_protocol: {data['evaluation_protocol']}",
-        f"bbox_usage_note: {data['bbox_usage_note']}",
     ]
     (out_dir / "train_config.txt").write_text("\n".join(lines) + "\n", encoding="utf-8")
 
@@ -3424,11 +3237,6 @@ def train_multi_agent(cfg: MultiAgentTrainConfig) -> None:
                     "tvi.",
                 ))
             ]
-            if cfg.use_roi_tokens:
-                critical_missing.extend(
-                    key for key in missing
-                    if key.startswith("roi_proj.")
-                )
             if not cfg.base_model:
                 critical_missing.extend(
                     key for key in missing
@@ -3739,15 +3547,6 @@ def parse_multi_agent_args() -> MultiAgentTrainConfig:
     ap.add_argument("--online_encode_missing", action="store_true")
     ap.add_argument("--image_size", type=int, default=384)
     ap.add_argument("--vision_resize_mode", choices=("letterbox", "stretch"), default="letterbox")
-    ap.add_argument("--use_roi_tokens", action="store_true")
-    ap.add_argument("--roi_token_count", type=int, default=16)
-    ap.add_argument("--roi_expand_ratio", type=float, default=1.5)
-    ap.add_argument("--roi_make_square", action=argparse.BooleanOptionalAction, default=True)
-    ap.add_argument(
-        "--roi_bbox_source",
-        choices=("ground_truth", "external_detector", "external_tracker", "previous_model_prediction"),
-        default="ground_truth",
-    )
     ap.add_argument("--epochs", type=int, default=1)
     ap.add_argument("--batch_size", type=int, default=2)
     ap.add_argument("--grad_accum_steps", type=int, default=1)
@@ -3919,8 +3718,6 @@ def parse_multi_agent_args() -> MultiAgentTrainConfig:
     ap.add_argument("--dry_run", action="store_true")
     args = ap.parse_args()
     data = vars(args)
-    if data.get("use_roi_tokens") and "--use-bbox-tokens" in sys.argv:
-        raise ValueError("--use_roi_tokens cannot be combined with explicit --use-bbox-tokens.")
     if data.pop("auto_alpha_xy"):
         data["alpha_xy"] = None
     return apply_multi_agent_base_defaults(MultiAgentTrainConfig(**data))
