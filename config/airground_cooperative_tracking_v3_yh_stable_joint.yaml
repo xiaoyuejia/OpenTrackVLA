@@ -1,0 +1,114 @@
+architecture: airground_three_stream_cooperative_v3
+data:
+  train_json: /data/yh/data/processed/train_jsonl
+  val_json: null
+  cache_root: /data/yh/data/processed/vision_cache
+  val_cache_root: null
+  perception_cache_root: /data/yh/data/processed/perception_cache
+  candidate_cache_root: /data/yh/data/processed/perception_cache
+  require_topk_candidate_cache: true
+  candidate_top_k: 8
+  train_episodes_manifest: /data/yh/data/manifests/train_joint.json
+  val_episodes_manifest: /data/yh/data/manifests/val_joint.json
+  expected_train_episodes: 9480
+  expected_val_episodes: 2400
+  history: 31
+  n_waypoints: 8
+  action_dims: 3
+  image_size: 384
+  vision_resize_mode: letterbox
+  online_encode_missing: false
+  allow_missing_perception_cache: false
+  target_match_iou_threshold: 0.30
+  train_target_reference_dropout_prob: 0.20
+  val_target_reference_dropout_prob: 0.0
+  train_synthetic_false_positive_prob: 0.0
+  val_synthetic_false_positive_prob: 0.0
+  train_temporal_stride: 5
+  coarse_cache_size: 8192
+  shuffle_block_size: 8
+  train_synthetic_drone_occlusion_prob: 0.50
+  train_synthetic_dog_occlusion_prob: 0.50
+  val_synthetic_drone_occlusion_prob: 0.50
+  val_synthetic_dog_occlusion_prob: 0.50
+  occlusion_seed: 731
+  # 十阶段线性 curriculum；第 10 个 epoch 达到原 hard-stage。
+  receiver_corruption_curriculum:
+    - {end_epoch: 1,  assistance_probability: 0.700, roi_only_probability: 0.700, current_full_probability: 0.300, recent_full_probability: 0.000, all_full_probability: 0.000, recent_history_lengths: [2],    pose_perturb_probability: 0.000, pose_translation_max_m: 0.250, pose_yaw_max_deg: 10.000}
+    - {end_epoch: 2,  assistance_probability: 0.717, roi_only_probability: 0.667, current_full_probability: 0.300, recent_full_probability: 0.028, all_full_probability: 0.005, recent_history_lengths: [2],    pose_perturb_probability: 0.056, pose_translation_max_m: 0.278, pose_yaw_max_deg: 12.222}
+    - {end_epoch: 3,  assistance_probability: 0.733, roi_only_probability: 0.633, current_full_probability: 0.300, recent_full_probability: 0.056, all_full_probability: 0.011, recent_history_lengths: [2],    pose_perturb_probability: 0.111, pose_translation_max_m: 0.306, pose_yaw_max_deg: 14.444}
+    - {end_epoch: 4,  assistance_probability: 0.750, roi_only_probability: 0.600, current_full_probability: 0.300, recent_full_probability: 0.083, all_full_probability: 0.017, recent_history_lengths: [2, 4], pose_perturb_probability: 0.167, pose_translation_max_m: 0.333, pose_yaw_max_deg: 16.667}
+    - {end_epoch: 5,  assistance_probability: 0.767, roi_only_probability: 0.567, current_full_probability: 0.300, recent_full_probability: 0.111, all_full_probability: 0.022, recent_history_lengths: [2, 4], pose_perturb_probability: 0.222, pose_translation_max_m: 0.361, pose_yaw_max_deg: 18.889}
+    - {end_epoch: 6,  assistance_probability: 0.783, roi_only_probability: 0.533, current_full_probability: 0.300, recent_full_probability: 0.139, all_full_probability: 0.028, recent_history_lengths: [2, 4], pose_perturb_probability: 0.278, pose_translation_max_m: 0.389, pose_yaw_max_deg: 21.111}
+    - {end_epoch: 7,  assistance_probability: 0.800, roi_only_probability: 0.500, current_full_probability: 0.300, recent_full_probability: 0.167, all_full_probability: 0.033, recent_history_lengths: [2, 4], pose_perturb_probability: 0.333, pose_translation_max_m: 0.417, pose_yaw_max_deg: 23.333}
+    - {end_epoch: 8,  assistance_probability: 0.817, roi_only_probability: 0.467, current_full_probability: 0.300, recent_full_probability: 0.194, all_full_probability: 0.039, recent_history_lengths: [2, 4], pose_perturb_probability: 0.389, pose_translation_max_m: 0.444, pose_yaw_max_deg: 25.556}
+    - {end_epoch: 9,  assistance_probability: 0.833, roi_only_probability: 0.433, current_full_probability: 0.300, recent_full_probability: 0.222, all_full_probability: 0.045, recent_history_lengths: [2, 4], pose_perturb_probability: 0.444, pose_translation_max_m: 0.472, pose_yaw_max_deg: 27.778}
+    - {end_epoch: 10, assistance_probability: 0.850, roi_only_probability: 0.400, current_full_probability: 0.300, recent_full_probability: 0.250, all_full_probability: 0.050, recent_history_lengths: [2, 4], pose_perturb_probability: 0.500, pose_translation_max_m: 0.500, pose_yaw_max_deg: 30.000}
+model:
+  llm_name: /data/yh/newtrackvla修改/newtrackvla_base_yh_clean/models/qwen3-0.6b
+  vision_feat_dim: 1536
+  freeze_llm: true
+  use_angle_tvi: false
+  insert_time_tokens: true
+  no_tanh_actions: true
+  alpha_xy: 1.0
+  text_max_length: 128
+  use_agent_text_markers: true
+  drone_target_verification_prompt: Compare all aerial-view person candidates using the target rule, history, and any valid start reference. The rule overrides a conflicting reference. For an appearance rule, match appearance; for an initial-target rule, preserve the first target identity. Score every candidate independently and accept only a sufficiently confident best match; ACT plans for the accepted target.
+  dog_target_verification_prompt: Compare all ground-view person candidates using the target rule, history, and any valid start reference. The rule overrides a conflicting reference. For an appearance rule, match appearance; for an initial-target rule, preserve the first target identity. Score every candidate independently and accept only a sufficiently confident best match; ACT plans for the accepted target.
+  num_modes: 4
+  coop_hidden_dim: 512
+  coop_encoder_layers: 1
+  coop_decoder_layers: 3
+  coop_num_heads: 8
+  coop_dropout: 0.0
+  jepa_hidden_dim: 512
+  jepa_decoder_layers: 3
+  jepa_num_heads: 8
+  jepa_dropout: 0.0
+  jepa_momentum: 0.996
+  detection_confidence_threshold: 0.25
+  target_match_confidence_threshold: 0.50
+  hard_visibility_routing: true
+  pose_position_scale_m: 20.0
+optimization:
+  out_dir: /data/yh/newtrackvla修改/newtrackvla_base_yh_clean/output/airground_v3_stable_joint_sharedref_20260904
+  epochs: 10
+  batch_size: 48
+  grad_accum_steps: 2
+  lr: 4.0e-5
+  lr_scheduler: cosine
+  warmup_steps: 300
+  min_lr: 4.0e-6
+  weight_decay: 0.01
+  grad_clip: 1.0
+  mixed_precision: true
+  beta_nav: 100.0
+  beta_cooperative_waypoint: 100.0
+  beta_mode_classification: 1.0
+  beta_jepa: 1.0
+  beta_target_belief: 1.0
+  beta_target_match: 1.0
+  beta_uncertainty: 0.1
+  beta_smoothness: 0.1
+  beta_kinematics: 0.1
+  beta_diversity: 0.1
+  beta_obstacle: 0.0
+  enable_projected_obstacle_loss: false
+runtime:
+  distributed: true
+  dist_backend: nccl
+  num_workers: 8
+  prefetch_factor: 3
+  seed: 731
+  log_every: 1
+  csv_logging: true
+  progress: true
+  compact_terminal_log: true
+  save_every: 2000
+  save_every_epochs: 1
+  max_ckpts: 0
+  eval_every: 0
+  eval_batches: 16
+  resume: false
+  init_ckpt: /data/yh/newtrackvla修改/newtrackvla_base_yh_clean/output/airground_v3_pro6000_joint/model_epoch001_step002672_final.pt

@@ -1,3 +1,0 @@
-# External dependencies used by the UnrealZoo Anchor Diffusion model and trajectory rendering.
-diffusers>=0.36.0,<0.37
-scipy>=1.10

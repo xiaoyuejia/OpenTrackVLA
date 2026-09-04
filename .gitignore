@@ -40,3 +40,51 @@ open_trackvla_hf
 
 sim_data
 
+# 本地 IDE、Python 和测试缓存
+.vscode/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.pid
+*.lock
+
+# 大模型、Unreal Engine runtime 和离线权重不上传
+/models/
+/unrealzoo/
+/offline_detection_segmentation/weights/
+
+# 与当前 AirGround 实验无关的旧 Adapter 工程及其数据产物
+/adapter/
+
+# 文档流程图保留 dot、绘图脚本和说明文字，只忽略可重新生成的渲染文件
+/docs/figures/*.png
+/docs/figures/*.pdf
+/docs/figures/*.svg
+
+# 运行期缓存、训练产物和评估产物
+/output/
+/index_cache/
+/offline_detection_segmentation/outputs/
+/offline_detection_segmentation/runtime/
+/adapter/data/
+/adapter/saved_ade/
+/exp9_4/models/
+/exp9_4/results/
+/exp9_4/runtime/
+/exp9_4/logs/
+/exp9_4/state/
+/exp9_4/summaries/
+/exp9_4/.pipeline.lock
+
+# 迁移备份和临时打包文件
+/.migration_stage/
+/migration_bundle/
+/backup_*/
+*.tar.zst
+*.sha256
+/=8.3,
+
+# exp9_4 的固定评估清单属于可复现实验配置，需要纳入 Git。
+!exp9_4/manifests/
+!exp9_4/manifests/*.json
+

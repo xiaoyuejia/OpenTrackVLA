@@ -16,7 +16,7 @@ from transformers import SiglipVisionModel, SiglipImageProcessor
 from PIL import Image
 
 
-ROI_SCHEMA_VERSION = "roi_tokens_v1"
+ROI_SCHEMA_VERSION = "roi_tokens_v2_bbox_bound"
 
 # ModelScope support - try to import, fallback gracefully
 try:
@@ -146,6 +146,7 @@ def build_roi_cache_payload(
     bbox_format: str,
     roi_valid: bool,
     crop_xyxy: Sequence[int],
+    source_bbox: Any = None,
     save_float32: bool = False,
 ) -> Dict[str, Any]:
     obj = tokens.float() if save_float32 else tokens.half()
@@ -158,6 +159,7 @@ def build_roi_cache_payload(
         "bbox_format": str(bbox_format),
         "roi_valid": bool(roi_valid),
         "crop_xyxy": [int(v) for v in crop_xyxy],
+        "source_bbox": list(_as_float_bbox(source_bbox) or [0.0, 0.0, 0.0, 0.0]),
     }
 
 
@@ -166,17 +168,30 @@ def roi_cache_matches(
     roi_token_count: int,
     roi_expand_ratio: float,
     roi_make_square: bool,
+    expected_bbox: Any = None,
+    allow_legacy_missing_source_bbox: bool = False,
 ) -> bool:
     if not isinstance(payload, dict):
         return False
-    if payload.get("schema_version") != ROI_SCHEMA_VERSION:
-        return False
+    schema_version = payload.get("schema_version")
+    if schema_version != ROI_SCHEMA_VERSION:
+        if not (allow_legacy_missing_source_bbox and schema_version == "roi_tokens_v1"):
+            return False
     if int(payload.get("roi_token_count", -1)) != int(roi_token_count):
         return False
     if abs(float(payload.get("roi_expand_ratio", -1.0)) - float(roi_expand_ratio)) > 1e-6:
         return False
     if bool(payload.get("roi_make_square", not roi_make_square)) != bool(roi_make_square):
         return False
+    if expected_bbox is not None:
+        cached_bbox = _as_float_bbox(payload.get("source_bbox"))
+        wanted_bbox = _as_float_bbox(expected_bbox)
+        if cached_bbox is None and allow_legacy_missing_source_bbox and wanted_bbox is not None:
+            pass
+        elif cached_bbox is None or wanted_bbox is None:
+            return False
+        elif any(abs(a - b) > 1e-6 for a, b in zip(cached_bbox, wanted_bbox)):
+            return False
     return isinstance(payload.get("tokens"), torch.Tensor)
 
 
@@ -185,9 +200,18 @@ def load_roi_cache(
     roi_token_count: int,
     roi_expand_ratio: float,
     roi_make_square: bool,
+    expected_bbox: Any = None,
+    allow_legacy_missing_source_bbox: bool = False,
 ) -> Dict[str, Any]:
     payload = torch.load(str(path), map_location="cpu")
-    if not roi_cache_matches(payload, roi_token_count, roi_expand_ratio, roi_make_square):
+    if not roi_cache_matches(
+        payload,
+        roi_token_count,
+        roi_expand_ratio,
+        roi_make_square,
+        expected_bbox=expected_bbox,
+        allow_legacy_missing_source_bbox=allow_legacy_missing_source_bbox,
+    ):
         raise ValueError(
             f"ROI cache config mismatch for {path}: expected "
             f"schema={ROI_SCHEMA_VERSION} tokens={roi_token_count} "
@@ -427,6 +451,9 @@ class VisionCacheConfig:
                     print(f"[WARNING] Local path not found, will try to download...")
 
         # 2. 检查 SigLIP (建议也用绝对路径)
+        siglip_env = os.getenv("SIGLIP_MODEL_PATH", "").strip()
+        if siglip_env and os.path.exists(siglip_env):
+            self.siglip_model_name = siglip_env
         if not os.path.exists(self.siglip_model_name):
             # 使用统一数据根目录下的 SigLIP 权重。
             abs_siglip = "/data/hdt/ntv_data/weights/siglip"

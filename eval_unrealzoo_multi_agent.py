@@ -1,16 +1,13 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""UnrealZoo 双 Agent MLP / Anchor Diffusion 闭环评估入口。
+"""AirGround-Coop V3 的 UnrealZoo 双 Agent 闭环运行时。
 
 整体功能：
 - 创建无人机、机器狗与行人的 UnrealZoo 场景，逐帧运行双 Agent闭环控制。
 - 可只重放离线采集的人体世界坐标轨迹，两个 Agent 与后续 RGB 仍由在线仿真闭环产生。
-- 根据 checkpoint 内容自动选择 ``model.py`` MLP 或 Anchor Diffusion 模型。
+- 模型与在线感知由 ``eval_airground_coop_v3.py`` 注入。
 - 支持无真值 bbox 的完整检测/跟踪评估，并统计距离、可见性、碰撞和 bbox IoU。
 - 将预测局部轨迹绘制为平滑彩色曲线，保存逐 episode 视频、JSON 与汇总指标。
-
-核心类：
-- ``UnrealZooMultiAgentPlanner``：加载 checkpoint、编码双视角历史、预测 bbox 与轨迹并转为动作。
 
 关键函数：
 - ``load_recorded_target_trajectories``：从采集 JSON 读取仅用于驱动人的世界坐标轨迹。
@@ -21,16 +18,15 @@
 - ``parse_args`` / ``main``：配置并启动多 episode 评估。
 
 主要输入输出：
-- 输入为 checkpoint 文件或目录、UnrealZoo 环境、episode 数、bbox 来源和控制参数。
+- 输入为 V3 planner、UnrealZoo 环境、episode 数和控制参数。
 - 输出位于 ``--save-path``，可由 ``python -m tools.calculate_unrealzoo_metrics`` 汇总。
 
-Habitat / EVT-Bench 原始评估链路保持为：
-``sh/eval.sh -> eval.py -> tools/trained_agent.py``。
 """
 
 from __future__ import annotations
 
 import argparse
+import copy
 import json
 import math
 import os
@@ -54,6 +50,19 @@ from tools.cache_gridpool import (
     crop_target_roi,
     grid_pool_tokens,
 )
+from tools.bbox_spatial import bbox_prompt_from_spatial, bbox_spatial_fields
+
+ROI_VISUAL_LAYOUT_PROMPT = (
+    "Visual layout: GLOBAL_HISTORY and GLOBAL_CURRENT encode scene geometry; "
+    "TARGET_ROI encodes the target person's identity and local motion. Combine all three."
+)
+
+
+def prepend_roi_visual_layout_prompt(text: str) -> str:
+    text = str(text or "").strip()
+    if ROI_VISUAL_LAYOUT_PROMPT in text:
+        return text
+    return f"Task: {text}\n{ROI_VISUAL_LAYOUT_PROMPT}"
 
 
 REPO_ROOT = Path(__file__).resolve().parent
@@ -80,16 +89,35 @@ _startup_env_id = _preparse_env_id()
 os.environ.setdefault("UNREALZOO_FAST_ENV_ID", _startup_env_id)
 print(f"[startup] importing UnrealZoo with fast env registration: {_startup_env_id}", flush=True)
 
-# Importing gym_unrealcv registers UnrealZoo gym environment ids.
+# 导入 gym_unrealcv 会注册 UnrealZoo 环境 ID。
 import gym  # noqa: E402
+
+# 旧版 Gym 的 entry-point loader 依赖已被 setuptools>=82 删除的 pkg_resources。
+# 使用等价的 importlib loader，避免环境已成功注册却在 gym.make() 时失败。
+try:  # noqa: SIM105
+    import pkg_resources as _pkg_resources  # noqa: F401,E402
+except ModuleNotFoundError:
+    import importlib  # noqa: E402
+
+    def _load_gym_entry_point(name: str):
+        module_name, separator, attribute_path = str(name).partition(":")
+        if not separator:
+            raise ValueError(f"Invalid Gym entry point: {name!r}")
+        value = importlib.import_module(module_name)
+        for attribute in attribute_path.split("."):
+            value = getattr(value, attribute)
+        return value
+
+    gym.envs.registration.load = _load_gym_entry_point
+
 import gym_unrealcv  # noqa: F401,E402
 print("[startup] UnrealZoo imports finished", flush=True)
 
 from generate_aerial_ground_human_tracking_small import (  # noqa: E402
     DEFAULT_ENV_ID,
     DEFAULT_INSTRUCTION,
-    HUMAN_SPEED_CHOICES_MPS,
-    agent_max_speed_for_human_speed,
+    HUMAN_SPEED_CHOICES_MPS as RECORDED_HUMAN_SPEED_CHOICES_MPS,
+    agent_max_speed_for_human_speed as recorded_agent_max_speed_for_human_speed,
     normalize_speed_args,
     action_for_target_space,
     classify_coop_agents,
@@ -102,6 +130,20 @@ from generate_aerial_ground_human_tracking_small import (  # noqa: E402
     place_initial_followers,
     reset_env,
 )
+
+# Evaluation also supports the slower target-speed stress case.  Keep this
+# mapping local so changing the evaluation protocol does not alter collection
+# defaults in UnrealZoo's recording scripts.
+HUMAN_SPEED_CHOICES_MPS = (0.5,) + tuple(RECORDED_HUMAN_SPEED_CHOICES_MPS)
+
+
+def agent_max_speed_for_human_speed(human_speed_mps: float) -> float:
+    key = round(float(human_speed_mps), 3)
+    if key in tuple(round(float(value), 3) for value in RECORDED_HUMAN_SPEED_CHOICES_MPS):
+        return recorded_agent_max_speed_for_human_speed(human_speed_mps)
+    # Evaluation target speed is allowed to be arbitrary. Unknown speeds use
+    # the 0.9 m/s agent profile so target speed does not silently change limits.
+    return 1.20
 from generate_drone_human_tracking_small import (  # noqa: E402
     EpisodeSkipped,
     UNREAL_UNITS_PER_METER,
@@ -159,12 +201,17 @@ def load_recorded_target_trajectories(
     当 ``source`` 是 ``split_manifest.json`` 时，只读取其中 ``test`` 清单，并按
     ``env_id`` 过滤场景，确保闭环仿真场景与录制人体世界坐标一致。
     """
+    manifest_items: dict[str, dict[str, Any]] = {}
     if source.is_file():
         with source.open("r", encoding="utf-8") as handle:
             source_obj = json.load(handle)
         if isinstance(source_obj, dict) and isinstance(source_obj.get("test"), list):
             input_root = Path(source_obj.get("input_root", source.parent)).expanduser()
             output_root = Path(source_obj.get("output_root", source.parent)).expanduser()
+            source_roots = [
+                Path(root).expanduser()
+                for root in source_obj.get("source_roots", [])
+            ]
             candidates = []
             for item in source_obj["test"]:
                 if env_id is not None and item.get("scene") != env_id:
@@ -175,27 +222,32 @@ def load_recorded_target_trajectories(
                         source.parent / "test_raw" / f"{key}_drone_info.json",
                         output_root / "test_raw" / f"{key}_drone_info.json",
                         input_root / f"{key}_drone_info.json",
+                        *(root / f"{key}_drone_info.json" for root in source_roots),
                     ]
                     path = next(
                         (candidate for candidate in path_candidates if candidate.is_file()),
                         path_candidates[0],
                     )
                     candidates.append((path, key))
+                    manifest_items[key] = dict(item)
                 elif "info" in item:
                     info_rel = str(item["info"])
                     episode_name = str(item.get("relative_dir", Path(info_rel).parent)) + "/" + str(
                         item.get("stem", Path(info_rel).name.removesuffix("_info.json"))
                     )
                     path_candidates = [
+                        Path(info_rel).expanduser(),
                         source.parent / "test_raw" / info_rel,
                         output_root / "test_raw" / info_rel,
                         input_root / info_rel,
+                        *(root / info_rel for root in source_roots),
                     ]
                     path = next(
                         (candidate for candidate in path_candidates if candidate.is_file()),
                         path_candidates[0],
                     )
                     candidates.append((path, episode_name))
+                    manifest_items[episode_name] = dict(item)
                 else:
                     raise KeyError(f"split manifest item has neither key nor info: {item}")
         else:
@@ -211,6 +263,7 @@ def load_recorded_target_trajectories(
 
     trajectories: list[dict[str, Any]] = []
     for path, episode_name in candidates:
+        manifest_item = manifest_items.get(episode_name, {})
         short_name = path.name.removesuffix("_drone_info.json")
         if episode_filter is not None and episode_name not in episode_filter and short_name not in episode_filter:
             continue
@@ -231,12 +284,38 @@ def load_recorded_target_trajectories(
         if companion_path is not None and companion_path.is_file():
             with companion_path.open("r", encoding="utf-8") as handle:
                 companion_records = json.load(handle)
+        replay_meta: dict[str, Any] = {}
+        replay_meta_path = manifest_item.get("replay_meta")
+        if replay_meta_path:
+            replay_meta_file = Path(str(replay_meta_path)).expanduser()
+            if not replay_meta_file.is_file():
+                raise FileNotFoundError(
+                    f"replay_meta listed by manifest does not exist: {replay_meta_file}"
+                )
+            with replay_meta_file.open("r", encoding="utf-8") as handle:
+                replay_meta = json.load(handle)
+            distractor_poses = replay_meta.get("distractor_poses_per_frame") or []
+            distractor_actions = replay_meta.get("distractor_actions_per_frame") or []
+            if len(distractor_poses) < len(records) or len(distractor_actions) < len(records):
+                raise ValueError(
+                    f"{replay_meta_file}: replay distractor frames shorter than target "
+                    f"trajectory ({len(distractor_poses)}/{len(distractor_actions)} vs {len(records)})"
+                )
+            expected_humans = int(replay_meta.get("human_count") or 0)
+            appearance_ids = replay_meta.get("human_appearance_ids") or []
+            if expected_humans and len(appearance_ids) != expected_humans:
+                raise ValueError(
+                    f"{replay_meta_file}: human appearance count {len(appearance_ids)} "
+                    f"does not match human_count={expected_humans}"
+                )
         poses: list[list[float]] = []
+        drone_action_records: list[dict[str, Any]] = []
         for frame_idx, record in enumerate(records):
             raw_pose = record.get("target_pose") if isinstance(record, dict) else None
             if not isinstance(raw_pose, (list, tuple)) or len(raw_pose) < 6:
                 raise ValueError(f"{path}: frame {frame_idx} has invalid target_pose")
             poses.append([float(value) for value in raw_pose[:6]])
+            drone_action_records.append(dict(record) if isinstance(record, dict) else {})
         if not poses:
             raise ValueError(f"{path}: no target_pose records found")
         first = dict(records[0]) if records and isinstance(records[0], dict) else {}
@@ -279,6 +358,17 @@ def load_recorded_target_trajectories(
                 if isinstance(drone_pose, list) and len(drone_pose) >= 6
                 else None,
                 "drone_camera": drone_camera,
+                "drone_action_records": drone_action_records,
+                "robotdog_action_records": [
+                    dict(record) if isinstance(record, dict) else {}
+                    for record in companion_records
+                ],
+                "instruction": manifest_item.get("instruction"),
+                "task_type": manifest_item.get("task_type"),
+                "replay_meta_source": str(
+                    Path(str(replay_meta_path)).expanduser().resolve()
+                ) if replay_meta_path else None,
+                "replay_meta": replay_meta,
             }
         )
     if not trajectories:
@@ -287,8 +377,303 @@ def load_recorded_target_trajectories(
     return trajectories
 
 
+def _recorded_dt_from_action_record(
+    record: dict[str, Any],
+    default_dt: float,
+    override_dt: float = 0.0,
+) -> float:
+    if float(override_dt) > 0.0:
+        return float(override_dt)
+    for key in ("base_velocity_dt_s", "effective_dt_s", "dt", "training_dt_s"):
+        value = record.get(key)
+        if isinstance(value, (int, float)) and float(value) > 0.0:
+            return float(value)
+    return float(default_dt)
+
+
+def _recorded_drone_action_from_record(
+    record: dict[str, Any],
+    source: str,
+    default_dt: float,
+    override_dt: float = 0.0,
+) -> Optional[list[float]]:
+    """Return a BP_drone set_move_bp action from one recorded info frame.
+
+    Four-dimensional fields such as ``env_action`` are already in the env action
+    space. Three-dimensional velocity fields are converted with the same
+    collection/eval convention: translation is velocity * dt, yaw remains a yaw
+    rate command.
+    """
+    if source == "none":
+        return None
+    raw = record.get(source)
+    if not isinstance(raw, (list, tuple)):
+        return None
+    try:
+        values = [float(value) for value in raw]
+    except Exception:
+        return None
+    if len(values) >= 4:
+        return [values[0], values[1], values[2], values[3]]
+    if len(values) >= 3:
+        dt = _recorded_dt_from_action_record(record, default_dt, override_dt=override_dt)
+        return [values[0] * dt, values[1] * dt, 0.0, values[2]]
+    return None
+
+
+def recorded_drone_action_for_step(
+    target_trajectory: Optional[dict[str, Any]],
+    args: argparse.Namespace,
+    step_idx: int,
+) -> tuple[Optional[list[float]], dict[str, Any]]:
+    source = str(getattr(args, "oracle_drone_action_source", "none") or "none")
+    debug = {
+        "enabled": source != "none",
+        "source": source,
+        "record_index": None,
+        "fallback": None,
+    }
+    if source == "none":
+        return None, debug
+    if target_trajectory is None:
+        debug["fallback"] = "no_recorded_target_trajectory"
+        return None, debug
+    records = target_trajectory.get("drone_action_records") or []
+    if not records:
+        debug["fallback"] = "no_drone_action_records"
+        return None, debug
+    if bool(getattr(args, "oracle_drone_action_hold_last", True)):
+        record_idx = min(step_idx, len(records) - 1)
+    elif step_idx >= len(records):
+        debug["fallback"] = "record_exhausted"
+        return None, debug
+    else:
+        record_idx = step_idx
+    record = records[record_idx]
+    if not isinstance(record, dict):
+        debug["fallback"] = "invalid_record"
+        return None, debug
+    default_dt = float(getattr(args, "dt", 0.1))
+    override_dt = float(getattr(args, "oracle_drone_velocity_dt", 0.0) or 0.0)
+    action = _recorded_drone_action_from_record(record, source, default_dt, override_dt=override_dt)
+    debug.update(
+        {
+            "record_index": int(record_idx),
+            "record_step": record.get("step"),
+            "record_dt": _recorded_dt_from_action_record(record, default_dt, override_dt=override_dt),
+            "record_dt_overridden": bool(override_dt > 0.0),
+            "record_command_label_source": record.get("command_label_source"),
+        }
+    )
+    if action is None:
+        debug["fallback"] = f"missing_or_invalid_{source}"
+        return None, debug
+    return action, debug
+
+
+def _recorded_robotdog_action_from_record(
+    record: dict[str, Any],
+    source: str,
+    default_dt: float,
+    override_dt: float = 0.0,
+) -> Optional[list[float]]:
+    if source == "none":
+        return None
+    raw = record.get(source)
+    if not isinstance(raw, (list, tuple)):
+        return None
+    try:
+        values = [float(value) for value in raw]
+    except Exception:
+        return None
+    if source in {"env_action", "ground_action", "controller_ground_action"} and len(values) >= 2:
+        return [values[0], values[1]]
+    if len(values) >= 3:
+        dt = _recorded_dt_from_action_record(record, default_dt, override_dt=override_dt)
+        turn_deg = math.degrees(values[2] * dt)
+        speed_cm_s = values[0] * UNREAL_UNITS_PER_METER
+        return [float(turn_deg), float(speed_cm_s)]
+    if len(values) >= 2:
+        return [values[0], values[1]]
+    return None
+
+
+def recorded_robotdog_action_for_step(
+    target_trajectory: Optional[dict[str, Any]],
+    args: argparse.Namespace,
+    step_idx: int,
+) -> tuple[Optional[list[float]], dict[str, Any]]:
+    source = str(getattr(args, "oracle_robotdog_action_source", "none") or "none")
+    debug = {
+        "enabled": source != "none",
+        "source": source,
+        "record_index": None,
+        "fallback": None,
+    }
+    if source == "none":
+        return None, debug
+    if target_trajectory is None:
+        debug["fallback"] = "no_recorded_target_trajectory"
+        return None, debug
+    records = target_trajectory.get("robotdog_action_records") or []
+    if not records:
+        debug["fallback"] = "no_robotdog_action_records"
+        return None, debug
+    if bool(getattr(args, "oracle_robotdog_action_hold_last", True)):
+        record_idx = min(step_idx, len(records) - 1)
+    elif step_idx >= len(records):
+        debug["fallback"] = "record_exhausted"
+        return None, debug
+    else:
+        record_idx = step_idx
+    record = records[record_idx]
+    if not isinstance(record, dict):
+        debug["fallback"] = "invalid_record"
+        return None, debug
+    default_dt = float(getattr(args, "dt", 0.1))
+    override_dt = float(getattr(args, "oracle_robotdog_velocity_dt", 0.0) or 0.0)
+    action = _recorded_robotdog_action_from_record(record, source, default_dt, override_dt=override_dt)
+    debug.update(
+        {
+            "record_index": int(record_idx),
+            "record_step": record.get("step"),
+            "record_dt": _recorded_dt_from_action_record(record, default_dt, override_dt=override_dt),
+            "record_dt_overridden": bool(override_dt > 0.0),
+            "record_command_label_source": record.get("command_label_source"),
+        }
+    )
+    if action is None:
+        debug["fallback"] = f"missing_or_invalid_{source}"
+        return None, debug
+    return action, debug
+
+
+def recorded_target_action_for_step(
+    target_trajectory: Optional[dict[str, Any]],
+    args: argparse.Namespace,
+    step_idx: int,
+    current_pose: Optional[list[float]] = None,
+) -> tuple[Optional[list[float]], dict[str, Any]]:
+    debug: dict[str, Any] = {
+        "enabled": True,
+        "source": "target_pose_inverse_fixed_dt",
+        "record_index": None,
+        "fallback": None,
+    }
+    if target_trajectory is None:
+        debug["fallback"] = "no_recorded_target_trajectory"
+        return None, debug
+    poses = target_trajectory.get("poses") or []
+    if step_idx >= len(poses) - 1:
+        debug["fallback"] = "record_exhausted"
+        return None, debug
+    dt = float(getattr(args, "dt", 0.1))
+    if abs(dt - 0.1) > 1e-8:
+        raise ValueError("recorded target pose inverse replay requires --dt 0.1")
+    reference_before = poses[step_idx]
+    reference_after = poses[step_idx + 1]
+    delay_steps = int(getattr(args, "target_ground_translation_delay_steps", 1))
+    translation_start = min(step_idx + delay_steps, len(poses) - 1)
+    translation_end = min(translation_start + 1, len(poses) - 1)
+    source_velocity = measured_body_velocity(
+        poses[translation_start], poses[translation_end], dt
+    )
+    actual = current_pose if current_pose is not None else reference_before
+    correction = measured_body_velocity(actual, reference_before, max(dt, float(
+        getattr(args, "target_inverse_position_feedback_time_s", 0.5)
+    )))
+    max_feedback = float(getattr(args, "target_inverse_max_forward_feedback_mps", 2.0))
+    forward_speed = float(source_velocity[0]) + float(
+        np.clip(correction[0], -max_feedback, max_feedback)
+    )
+    desired_yaw_delta_deg = _wrap_degrees(
+        float(reference_after[4]) - float(actual[4])
+    )
+    yaw_gain = max(float(getattr(args, "target_ground_yaw_gain", 0.4)), 1e-6)
+    turn_command_deg = desired_yaw_delta_deg / yaw_gain
+    debug.update(
+        {
+            "record_index": int(step_idx),
+            "dt_s": dt,
+            "translation_delay_steps": delay_steps,
+            "translation_pose_indices": [translation_start, translation_end],
+            "source_body_velocity_mps": source_velocity,
+            "position_feedback_body_velocity_mps": correction,
+            "desired_forward_speed_mps": forward_speed,
+            "unexecutable_lateral_speed_mps": float(source_velocity[1] + correction[1]),
+            "desired_yaw_delta_deg": desired_yaw_delta_deg,
+            "ground_yaw_gain": yaw_gain,
+            "turn_command_deg": turn_command_deg,
+        }
+    )
+    return [float(turn_command_deg), float(forward_speed * UNREAL_UNITS_PER_METER)], debug
+
+
+def replay_distractor_actions_for_step(
+    target_trajectory: Optional[dict[str, Any]], step_idx: int
+) -> list[list[float]]:
+    """Read recorded distractor ground actions; no model/oracle follower action."""
+    if target_trajectory is None:
+        return []
+    meta = target_trajectory.get("replay_meta") or {}
+    rows = meta.get("distractor_actions_per_frame") or []
+    if step_idx >= len(rows) or not isinstance(rows[step_idx], list):
+        return []
+    actions: list[list[float]] = []
+    for item in rows[step_idx]:
+        raw = item.get("action") if isinstance(item, dict) else None
+        if isinstance(raw, (list, tuple)) and len(raw) >= 2:
+            actions.append([float(raw[0]), float(raw[1])])
+    return actions
+
+
+def apply_recorded_step_timing(
+    env,
+    setup: dict[str, Any],
+    target_trajectory: Optional[dict[str, Any]],
+    args: argparse.Namespace,
+    step_idx: int,
+) -> Optional[dict[str, Any]]:
+    if not bool(getattr(args, "oracle_recorded_step_timing", False)):
+        return None
+    if target_trajectory is None:
+        return {"enabled": True, "fallback": "no_recorded_target_trajectory"}
+    records = target_trajectory.get("drone_action_records") or []
+    if not records:
+        return {"enabled": True, "fallback": "no_drone_action_records"}
+    record_idx = min(step_idx, len(records) - 1)
+    record = records[record_idx]
+    interval_ms = record.get("ue_interval_ms")
+    if not isinstance(interval_ms, (int, float)) or float(interval_ms) <= 0.0:
+        dt = _recorded_dt_from_action_record(record, float(getattr(args, "dt", 0.1)))
+        interval_ms = int(round(dt * 1000.0))
+    interval_ms = max(1, int(round(float(interval_ms))))
+    try:
+        env.unwrapped.interval = interval_ms
+    except Exception:
+        pass
+    applied: list[str] = []
+    for name in (setup.get("target_name"), setup.get("robotdog_name"), setup.get("drone_name")):
+        if not name:
+            continue
+        try:
+            env.unwrapped.unrealcv.set_interval(name, interval_ms)
+            applied.append(str(name))
+        except Exception:
+            pass
+    return {
+        "enabled": True,
+        "record_index": int(record_idx),
+        "record_step": record.get("step"),
+        "ue_interval_ms": int(interval_ms),
+        "applied_to": applied,
+        "effective_dt_s": record.get("effective_dt_s"),
+        "base_velocity_dt_s": record.get("base_velocity_dt_s"),
+    }
+
+
 def _set_recorded_target_pose(env, setup: dict[str, Any], pose: list[float]) -> None:
-    """将人精确放到录制位姿，并让导航目标停在当前位置以避免 AI 自主移动。"""
+    """Set an initial/current hold pose; never used for future action replay."""
     env.unwrapped.unrealcv.set_obj_location(setup["target_name"], pose[:3])
     try:
         env.unwrapped.unrealcv.set_obj_rotation(setup["target_name"], pose[3:6])
@@ -351,7 +736,7 @@ def apply_recorded_agent_cameras(
     drone_pitch: float,
     drone_yaw_offset: float,
 ) -> tuple[Any, float, float, float, float, dict[str, bool]]:
-    """Optionally replace searched cameras with recorded first-frame cameras."""
+    """Replace searched cameras only when each recorded camera is complete."""
     restored = {"robotdog": False, "drone": False}
     if target_trajectory is None:
         return dog_mount, dog_pitch, dog_yaw_offset, drone_pitch, drone_yaw_offset, restored
@@ -360,23 +745,27 @@ def apply_recorded_agent_cameras(
     mount = dog_camera.get("mount")
     pitch = dog_camera.get("pitch")
     yaw_offset = dog_camera.get("yaw_offset")
-    if isinstance(mount, list) and len(mount) >= 3:
+    dog_camera_complete = (
+        isinstance(mount, list)
+        and len(mount) >= 3
+        and isinstance(pitch, (int, float))
+        and isinstance(yaw_offset, (int, float))
+    )
+    if dog_camera_complete:
         dog_mount = [float(value) for value in mount[:3]]
-        restored["robotdog"] = True
-    if isinstance(pitch, (int, float)):
         dog_pitch = float(pitch)
-        restored["robotdog"] = True
-    if isinstance(yaw_offset, (int, float)):
         dog_yaw_offset = float(yaw_offset)
         restored["robotdog"] = True
 
     drone_camera = target_trajectory.get("drone_camera") or {}
     pitch = drone_camera.get("pitch")
     yaw_offset = drone_camera.get("yaw_offset")
-    if isinstance(pitch, (int, float)):
+    drone_camera_complete = (
+        isinstance(pitch, (int, float))
+        and isinstance(yaw_offset, (int, float))
+    )
+    if drone_camera_complete:
         drone_pitch = float(pitch)
-        restored["drone"] = True
-    if isinstance(yaw_offset, (int, float)):
         drone_yaw_offset = float(yaw_offset)
         restored["drone"] = True
 
@@ -574,14 +963,44 @@ def _overlay_text(frame: np.ndarray, lines: list[str]) -> np.ndarray:
     return out
 
 
+def _trajectory_source_label(action_debug: dict[str, Any], agent_index: int) -> str:
+    """Return the branch that produced the trajectory rendered for an agent."""
+    mode_names = action_debug.get("routing_mode_name")
+    mode: Any = None
+    if isinstance(mode_names, np.ndarray):
+        if mode_names.ndim > 0 and mode_names.size > agent_index:
+            mode = mode_names.reshape(-1)[agent_index]
+    elif isinstance(mode_names, (list, tuple)) and len(mode_names) > agent_index:
+        mode = mode_names[agent_index]
+    if mode is None:
+        source_key = "drone_action_source" if agent_index == 0 else "robotdog_action_source"
+        mode = action_debug.get(source_key)
+    if mode is None:
+        mode = action_debug.get("action_source")
+
+    normalized = str(mode or "unknown").strip().lower()
+    labels = {
+        "self": "SELF",
+        "cooperative": "COOPERATIVE",
+        "belief": "BELIEF",
+        "search": "SEARCH",
+    }
+    if normalized in labels:
+        return labels[normalized]
+    if not normalized or normalized == "none":
+        return "UNKNOWN"
+    # Keep legacy planner action-source fallbacks readable in a narrow overlay.
+    return normalized.replace("_", " ").upper()[:32]
+
+
 def _candidate_label(candidate: Any, score: Any) -> str:
-    """Format Anchor Diffusion mode selection without cluttering MLP videos."""
+    """Format the V3 cooperative mode selection for video overlays."""
     if candidate is None or score is None:
-        return "planner=MLP"
+        return "planner=V3"
     return f"mode={int(candidate)} score={float(score):.2f}"
 
 
-# ----------------------- 双 Agent模型加载与在线规划 -----------------------
+# ----------------------- V3 planner injection -----------------------
 
 def waypoint_index_to_source_step(
     index: int,
@@ -589,682 +1008,27 @@ def waypoint_index_to_source_step(
     horizon_steps: int,
 ) -> int:
     """Map an origin-inclusive waypoint index to a positive source action step."""
-    if waypoint_count <= 1:
-        return 1
+    if waypoint_count <= 1 or index <= 0:
+        raise ValueError("Waypoint action selection requires a future point with index >= 1")
     return max(1, int(round(index * max(1, horizon_steps) / (waypoint_count - 1))))
 
 
 class UnrealZooMultiAgentPlanner:
-    """Online wrapper: RGB frames -> visual tokens -> model waypoints -> UE actions."""
+    """Injection slot replaced by eval_airground_coop_v3 before runtime main."""
 
-    def __init__(self, args: argparse.Namespace):
-        self.args = args
-        self.device = torch.device(args.device if args.device else ("cuda" if torch.cuda.is_available() else "cpu"))
-        ckpt_path = _latest_checkpoint(Path(args.ckpt))
-        if ckpt_path is None:
-            raise FileNotFoundError(f"No checkpoint found from --ckpt: {args.ckpt}")
-        self.ckpt_path = ckpt_path
-
-        print(f"[startup] loading checkpoint metadata/state from CPU: {ckpt_path}", flush=True)
-        load_t0 = time.time()
-        try:
-            obj = torch.load(str(ckpt_path), map_location="cpu")
-        except Exception:
-            obj = torch.load(str(ckpt_path), map_location="cpu", weights_only=False)
-        print(f"[startup] checkpoint loaded in {time.time() - load_t0:.1f}s", flush=True)
-        ckpt_cfg = obj.get("config", {}) if isinstance(obj, dict) else {}
-        state = _cleanup_state_dict_keys(obj.get("model_state", {}) if isinstance(obj, dict) else {})
-        self.use_roi_tokens = bool(args.use_roi_tokens or ckpt_cfg.get("use_roi_tokens", False))
-        self.roi_token_count = int(ckpt_cfg.get("roi_token_count", args.roi_token_count))
-        self.roi_expand_ratio = float(ckpt_cfg.get("roi_expand_ratio", args.roi_expand_ratio))
-        self.roi_make_square = bool(ckpt_cfg.get("roi_make_square", args.roi_make_square))
-        self.roi_bbox_source = str(ckpt_cfg.get("roi_bbox_source", args.roi_bbox_source))
-        self.evaluation_protocol = (
-            "oracle_roi_upper_bound" if self.use_roi_tokens else str(ckpt_cfg.get("evaluation_protocol", "global_only"))
-        )
-        if self.use_roi_tokens:
-            side = int(round(math.sqrt(self.roi_token_count)))
-            if side * side != self.roi_token_count:
-                raise ValueError(f"ROI token count must be a perfect square, got {self.roi_token_count}")
-            if self.roi_bbox_source != "ground_truth":
-                raise NotImplementedError(
-                    f"roi_bbox_source={self.roi_bbox_source!r} is not implemented; "
-                    "current oracle-ROI evaluation only supports ground_truth."
-                )
-        if ckpt_cfg.get("model_type") == "base_multi_agent_concat":
-            raise RuntimeError(
-                "This checkpoint is a train_multi_agent_base.py / model_multi_agent_base.py base-concat checkpoint. "
-                "Evaluate it with eval_unrealzoo_multi_agent_base.py, for example by setting "
-                "EVAL_SCRIPT=eval_unrealzoo_multi_agent_base.py in sh/run_multi_agent_eval.sh."
-            )
-        self.use_anchor_diffusion = bool(
-            ckpt_cfg.get("use_anchor_diffusion", False)
-            or "planner_agent1.anchors" in state
-            or "planner_agent2.anchors" in state
-        )
-        if self.use_roi_tokens and self.use_anchor_diffusion:
-            raise NotImplementedError("ROI tokens are implemented for model.py MLP checkpoints, not Anchor Diffusion checkpoints.")
-        if self.use_anchor_diffusion:
-            expected_metadata = {
-                "grounding_architecture": "dual_agent_gnd_v2",
-                "multimodal_sequence_layout": "dual_visual_before_queries_v2",
-                "action_scale_version": "anchor_maxabs_v2",
-            }
-            incompatible = {
-                key: ckpt_cfg.get(key)
-                for key, expected in expected_metadata.items()
-                if ckpt_cfg.get(key) != expected
-            }
-            if incompatible:
-                raise RuntimeError(
-                    "Checkpoint is incompatible with the corrected Anchor Diffusion architecture. "
-                    f"Expected {expected_metadata}, found {incompatible}. Retrain from scratch."
-                )
-            from cundang.model_unrealzoo_anchor_diffusion import MultiAgentModelConfig, MultiAgentOpenTrackVLA
-            MultiAgentModelClass = MultiAgentOpenTrackVLA
-            model_source = "model_unrealzoo_anchor_diffusion.py Anchor Diffusion"
-            # 早期自包含 scheduler 将 alphas_cumprod 写入 checkpoint；diffusers
-            # 调度器会自行重建同类状态，因此加载新版模型时丢弃旧 buffer。
-            state = {k: v for k, v in state.items() if not k.endswith("scheduler.alphas_cumprod")}
-        else:
-            from model import MultiAgentModelConfig, MultiAgentOpenTrackVLA, MultiAgentSeparateOpenTrackVLA
-            use_separate_context = bool(
-                ckpt_cfg.get("separate_agent_context", False)
-                or ckpt_cfg.get("model_type") == "model_py_multi_agent_separate_base"
-            )
-            MultiAgentModelClass = MultiAgentSeparateOpenTrackVLA if use_separate_context else MultiAgentOpenTrackVLA
-            model_source = "model.py separate-context MLP planner" if use_separate_context else "model.py MLP planner"
-        has_planner_agent1 = any(k.startswith("planner_agent1.") for k in state)
-        has_planner_agent2 = any(k.startswith("planner_agent2.") for k in state)
-        print(
-            f"[planner] checkpoint model_type={ckpt_cfg.get('model_type')} "
-            f"separate_agent_context={ckpt_cfg.get('separate_agent_context')} "
-            f"model_source={model_source}",
-            flush=True,
-        )
-        print(
-            "[planner] agent_order=drone,robotdog "
-            "binding=drone:planner_agent1/waypoints[0],robotdog:planner_agent2/waypoints[1] "
-            f"planner_agent1={has_planner_agent1} planner_agent2={has_planner_agent2}",
-            flush=True,
-        )
-        if not has_planner_agent1 or not has_planner_agent2:
-            raise RuntimeError(
-                "Checkpoint does not contain both planner_agent1.* and planner_agent2.* weights. "
-                "Cannot bind drone to planner_agent1 and robotdog to planner_agent2 safely."
-            )
-        self.ckpt_bbox_dropout_prob = float(ckpt_cfg.get("bbox_dropout_prob", 0.0))
-        if self.use_roi_tokens and args.bbox_source != "none":
-            print(
-                f"[planner] use_roi_tokens=True ignores --bbox-source={args.bbox_source!r} as a model numeric input; "
-                "bbox_feat=None and bbox tokens are disabled. Ground-truth bbox is used only as roi_bbox for cropping.",
-                flush=True,
-            )
-        if args.bbox_source in {"model", "none"} and self.ckpt_bbox_dropout_prob <= 0.0:
-            print(
-                "[planner][warn] checkpoint was not trained with bbox_dropout_prob > 0; "
-                "prior-free detection may be unreliable and should be treated as an ablation.",
-                flush=True,
-            )
-        self.history = int(ckpt_cfg.get("history", args.history))
-        self.history_frame_dt = float(
-            args.history_frame_dt if args.history_frame_dt > 0.0 else args.dt
-        )
-        self.n_waypoints = int(ckpt_cfg.get("n_waypoints", args.n_waypoints))
-        self.action_dims = int(ckpt_cfg.get("action_dims", 3))
-        vision_feat_dim = int(ckpt_cfg.get("vision_feat_dim", args.vision_feat_dim))
-
-        model_cfg_kwargs = dict(
-            llm_name=str(ckpt_cfg.get("llm_name", args.llm_name)),
-            freeze_llm=True,
-            n_waypoints=self.n_waypoints,
-            action_dims=self.action_dims,
-            use_angle_tvi=bool(ckpt_cfg.get("use_angle_tvi", args.use_angle_tvi)),
-            insert_time_tokens=bool(ckpt_cfg.get("insert_time_tokens", True)),
-            use_tanh_actions=not bool(ckpt_cfg.get("no_tanh_actions", args.no_tanh_actions)),
-            alpha_xy=ckpt_cfg.get("alpha_xy", args.alpha_xy),
-            return_token_logits=False,
-        )
-        if not self.use_anchor_diffusion:
-            ckpt_use_grounding = bool(ckpt_cfg.get("use_grounding", True))
-            ckpt_use_bbox_tokens = bool(ckpt_cfg.get("use_bbox_tokens", True))
-            model_cfg_kwargs.update(
-                use_grounding=False if self.use_roi_tokens else ckpt_use_grounding,
-                use_bbox_tokens=False if self.use_roi_tokens else ckpt_use_bbox_tokens,
-                use_agent_text_markers=bool(ckpt_cfg.get("use_agent_text_markers", True)),
-                use_roi_tokens=self.use_roi_tokens,
-                roi_token_count=self.roi_token_count,
-            )
-            if self.use_roi_tokens and (ckpt_use_grounding or ckpt_use_bbox_tokens):
-                print(
-                    "[planner] ROI protocol active: forcing use_grounding=False, "
-                    "use_bbox_tokens=False, bbox_feat=None. roi_bbox is used only for image crop.",
-                    flush=True,
-                )
-        if self.use_anchor_diffusion:
-            model_cfg_kwargs.update(
-                use_anchor_diffusion=True,
-                diffusion_anchor_path=ckpt_cfg.get("diffusion_anchor_path"),
-                diffusion_agent1_anchor_path=ckpt_cfg.get("diffusion_agent1_anchor_path"),
-                diffusion_agent2_anchor_path=ckpt_cfg.get("diffusion_agent2_anchor_path"),
-                diffusion_num_anchors=int(ckpt_cfg.get("diffusion_num_anchors", args.diffusion_num_anchors)),
-                diffusion_hidden_dim=int(ckpt_cfg.get("diffusion_hidden_dim", args.diffusion_hidden_dim)),
-                diffusion_depth=int(ckpt_cfg.get("diffusion_depth", args.diffusion_depth)),
-                diffusion_num_heads=int(ckpt_cfg.get("diffusion_num_heads", args.diffusion_num_heads)),
-                diffusion_mlp_ratio=float(ckpt_cfg.get("diffusion_mlp_ratio", 4.0)),
-                diffusion_dropout=float(ckpt_cfg.get("diffusion_dropout", 0.0)),
-                diffusion_num_train_timesteps=int(ckpt_cfg.get("diffusion_num_train_timesteps", 1000)),
-                diffusion_train_truncation_steps=int(ckpt_cfg.get("diffusion_train_truncation_steps", 50)),
-                diffusion_inference_start_timestep=int(ckpt_cfg.get("diffusion_inference_start_timestep", 10)),
-                diffusion_inference_steps=int(ckpt_cfg.get("diffusion_inference_steps", 2)),
-                diffusion_score_loss_weight=float(ckpt_cfg.get("diffusion_score_loss_weight", 100.0)),
-                diffusion_score_loss_reduction=str(ckpt_cfg.get("diffusion_score_loss_reduction", "mean")),
-                diffusion_deterministic_inference=bool(args.diffusion_deterministic_inference),
-            )
-        model_cfg = MultiAgentModelConfig(**model_cfg_kwargs)
-        if not self.use_anchor_diffusion and model_cfg.is_base_variant:
-            layout = (
-                "[joint_text, agent1_text, agent1_visual, agent2_text, agent2_visual, ACT1, ACT2]"
-                if model_cfg.use_agent_text_markers
-                else "[joint_text, agent1_visual, agent2_visual, ACT1, ACT2]"
-            )
-            print(f"[planner] shared_context_layout={layout}", flush=True)
-        print(f"[startup] building {model_source} on {self.device}", flush=True)
-        self.model = MultiAgentModelClass(model_cfg, vision_feat_dim=vision_feat_dim).to(self.device).eval()
-        missing, unexpected = self.model.load_state_dict(state, strict=False)
-        if not any(k.startswith("planner_agent1") for k in state.keys()):
-            raise ValueError(
-                "This checkpoint does not look like a MultiAgentOpenTrackVLA checkpoint. "
-                "Habitat single-agent checkpoints should still be evaluated with sh/eval.sh."
-            )
-        if self.use_anchor_diffusion and "gnd_token_1" not in state:
-            print(
-                "[planner][warn] checkpoint uses the old shared-GND grounding architecture; "
-                "planning weights were loaded, but dual-GND bbox/visibility outputs are newly initialized. "
-                "Retrain before evaluating grounding metrics.",
-                flush=True,
-            )
-        critical_prefixes = ["planner_agent1.", "planner_agent2.", "proj.", "tvi."]
-        if self.use_roi_tokens:
-            critical_prefixes.append("roi_proj.")
-        if self.use_anchor_diffusion or bool(ckpt_cfg.get("use_grounding", True)):
-            critical_prefixes.extend(["grounding_head.", "grounding_to_act."])
-        critical_missing = [key for key in missing if key.startswith(tuple(critical_prefixes))]
-        if self.use_anchor_diffusion:
-            critical_missing.extend(
-                key for key in missing
-                if key in {"act_token_1", "act_token_2", "gnd_token_1", "gnd_token_2"}
-            )
-        elif bool(ckpt_cfg.get("use_grounding", True)):
-            critical_missing.extend(
-                key for key in missing
-                if key in {"act_token_1", "act_token_2", "gnd_token_1", "gnd_token_2", "grounding_act_gate"}
-            )
-        if critical_missing:
-            raise RuntimeError(f"Checkpoint is missing critical model weights: {critical_missing[:20]}")
-        print(
-            f"[planner] loaded {ckpt_path} missing={len(missing)} unexpected={len(unexpected)} "
-            f"history={self.history} history_frame_dt={self.history_frame_dt:.3f}s "
-            f"n_waypoints={self.n_waypoints} anchor_diffusion={self.use_anchor_diffusion}",
-            flush=True,
+    def __init__(self, *_args: Any, **_kwargs: Any) -> None:
+        raise RuntimeError(
+            "Use eval_airground_coop_v3.py; the shared UnrealZoo runtime "
+            "does not load a model directly."
         )
 
-        print("[startup] loading online DINO + SigLIP visual encoders", flush=True)
-        vision_t0 = time.time()
-        self.encoder = VisionFeatureCacher(
-            VisionCacheConfig(
-                image_size=args.image_size,
-                batch_size=2,
-                device=str(self.device),
-                resize_mode=args.vision_resize_mode,
-            )
-        ).eval()
-        print(f"[startup] visual encoders loaded in {time.time() - vision_t0:.1f}s", flush=True)
-        history_capacity = max(self.history * 4, self.history + 1)
-        self.histories: list[deque[tuple[float, torch.Tensor]]] = [
-            deque(maxlen=history_capacity),
-            deque(maxlen=history_capacity),
-        ]
-        self.last_waypoints: Optional[np.ndarray] = None
-        self.last_predicted_bbox: Optional[np.ndarray] = None
-
-    def reset(self) -> None:
-        for hist in self.histories:
-            hist.clear()
-        self.last_waypoints = None
-        self.last_predicted_bbox = None
-
-    @torch.inference_mode()
-    def _encode_pair(
-        self,
-        drone_frame_bgr: np.ndarray,
-        dog_frame_bgr: np.ndarray,
-        drone_roi_bbox: Optional[list[float]] = None,
-        dog_roi_bbox: Optional[list[float]] = None,
-    ) -> tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor], dict[str, Any]]:
-        pils = []
-        for frame in (drone_frame_bgr, dog_frame_bgr):
-            rgb = cv2.cvtColor(ensure_bgr_uint8(frame), cv2.COLOR_BGR2RGB)
-            pils.append(Image.fromarray(rgb))
-        global_t0 = time.perf_counter()
-        tok_dino, hp, wp = self.encoder._encode_dino(pils)
-        tok_sigl = self.encoder._encode_siglip(pils, out_hw=(hp, wp))
-        tokens = torch.cat([tok_dino, tok_sigl], dim=-1)
-        vfine = grid_pool_tokens(tokens, hp, wp, out_tokens=64).float().cpu()
-        vcoarse = grid_pool_tokens(tokens, hp, wp, out_tokens=4).float().cpu()
-        global_encoding_time = time.perf_counter() - global_t0
-
-        roi_tokens = None
-        roi_valid = None
-        roi_encoding_time = 0.0
-        roi_crop_xyxy: list[list[int]] = [[0, 0, 0, 0], [0, 0, 0, 0]]
-        if self.use_roi_tokens:
-            # roi_bbox is oracle ground-truth here and is used only for image crop.
-            # It is never projected as bbox_feat or appended as a bbox token.
-            roi_pils: list[Image.Image] = []
-            roi_valid_values: list[bool] = []
-            try:
-                for idx, (pil, bbox) in enumerate(zip(pils, (drone_roi_bbox, dog_roi_bbox))):
-                    roi_img, valid, crop_xyxy = crop_target_roi(
-                        pil,
-                        bbox,
-                        bbox_format="xywh_pixel",
-                        expand_ratio=self.roi_expand_ratio,
-                        make_square=self.roi_make_square,
-                    )
-                    roi_pils.append(roi_img)
-                    roi_valid_values.append(bool(valid))
-                    roi_crop_xyxy[idx] = [int(v) for v in crop_xyxy]
-                roi_t0 = time.perf_counter()
-                roi_tokens = self.encoder.encode_pooled_tokens(roi_pils, self.roi_token_count).float().cpu()
-                roi_encoding_time = time.perf_counter() - roi_t0
-                roi_valid = torch.tensor(roi_valid_values, dtype=torch.bool)
-            finally:
-                for roi_img in roi_pils:
-                    try:
-                        roi_img.close()
-                    except Exception:
-                        pass
-
-        encode_info = {
-            "roi_bbox_source": self.roi_bbox_source if self.use_roi_tokens else None,
-            "evaluation_protocol": self.evaluation_protocol if self.use_roi_tokens else None,
-            "roi_valid": roi_valid.tolist() if roi_valid is not None else None,
-            "roi_crop_xyxy": roi_crop_xyxy if self.use_roi_tokens else None,
-            "roi_expand_ratio": self.roi_expand_ratio if self.use_roi_tokens else None,
-            "roi_token_count": self.roi_token_count if self.use_roi_tokens else None,
-            "global_encoding_time": float(global_encoding_time),
-            "roi_encoding_time": float(roi_encoding_time),
-        }
-        return vcoarse, vfine, roi_tokens, roi_valid, encode_info
-
-    def _history_tensor(
-        self,
-        agent_idx: int,
-        current_coarse: torch.Tensor,
-        observation_time: float,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        hist = self.histories[agent_idx]
-        current_coarse = current_coarse.cpu()
-
-        # Training uses consecutive 0.1 s frames. Realtime inference is much
-        # slower, so sample sparse observations onto the same temporal grid
-        # instead of treating each inference call as one 0.1 s frame.
-        entries = list(hist)
-        if not entries:
-            frames = [current_coarse]
-        else:
-            target_times = [
-                observation_time - (self.history - index) * self.history_frame_dt
-                for index in range(self.history)
-            ]
-            frames = []
-            entry_index = 0
-            for target_time in target_times:
-                while (
-                    entry_index + 1 < len(entries)
-                    and entries[entry_index + 1][0] <= target_time + 1e-6
-                ):
-                    entry_index += 1
-                frames.append(entries[entry_index][1])
-        if len(frames) < self.history:
-            frames = [frames[0]] * (self.history - len(frames)) + frames
-        coarse = torch.cat(frames, dim=0)
-        tidx = torch.cat([torch.full((tok.size(0),), i, dtype=torch.long) for i, tok in enumerate(frames)], dim=0)
-        hist.append((float(observation_time), current_coarse))
-        return coarse, tidx
-
-    @torch.inference_mode()
-    def predict(
-        self,
-        drone_frame_bgr: np.ndarray,
-        dog_frame_bgr: np.ndarray,
-        drone_bbox: Optional[list[float]],
-        dog_bbox: Optional[list[float]],
-        instruction: str,
-        joint_instruction: Optional[str] = None,
-        agent1_instruction: Optional[str] = None,
-        agent2_instruction: Optional[str] = None,
-        observation_time: Optional[float] = None,
-        drone_roi_bbox: Optional[list[float]] = None,
-        dog_roi_bbox: Optional[list[float]] = None,
-    ) -> dict[str, Any]:
-        vcoarse, vfine, roi_tokens, roi_valid, encode_info = self._encode_pair(
-            drone_frame_bgr,
-            dog_frame_bgr,
-            drone_roi_bbox=drone_roi_bbox,
-            dog_roi_bbox=dog_roi_bbox,
-        )
-        if observation_time is None:
-            observation_time = time.monotonic()
-        coarse_items = []
-        coarse_tidx_items = []
-        for agent_idx in range(2):
-            c, ct = self._history_tensor(
-                agent_idx,
-                vcoarse[agent_idx],
-                float(observation_time),
-            )
-            coarse_items.append(c)
-            coarse_tidx_items.append(ct)
-
-        coarse_tokens = torch.stack(coarse_items, dim=0).unsqueeze(0).to(self.device)
-        coarse_tidx = torch.stack(coarse_tidx_items, dim=0).unsqueeze(0).to(self.device)
-        fine_tokens = vfine.unsqueeze(0).to(self.device)
-        fine_tidx = torch.full((1, 2, vfine.size(1)), self.history, dtype=torch.long, device=self.device)
-        bbox_input = None
-        if self.use_roi_tokens:
-            bbox_input = None
-        elif self.args.bbox_source == "ground_truth":
-            bbox_input = [drone_bbox or [0.0] * 4, dog_bbox or [0.0] * 4]
-        elif self.args.bbox_source == "model" and self.last_predicted_bbox is not None:
-            bbox_input = self.last_predicted_bbox.tolist()
-        bbox_feat = (
-            torch.tensor([bbox_input], dtype=torch.float32, device=self.device)
-            if bbox_input is not None
-            else None
-        )
-
-        model_kwargs = dict(
-            coarse_tokens=coarse_tokens,
-            coarse_tidx=coarse_tidx,
-            fine_tokens=fine_tokens,
-            fine_tidx=fine_tidx,
-            instructions=[instruction],
-            bbox_feat=bbox_feat,
-            return_dict=True,
-        )
-        if self.use_roi_tokens:
-            if roi_tokens is None or roi_valid is None:
-                raise RuntimeError("use_roi_tokens=True but online ROI encoding did not produce roi_tokens/roi_valid.")
-            model_kwargs.update(
-                roi_tokens=roi_tokens.unsqueeze(0).to(self.device),
-                roi_tidx=torch.full(
-                    (1, 2, roi_tokens.size(1)),
-                    self.history,
-                    dtype=torch.long,
-                    device=self.device,
-                ),
-                roi_valid=roi_valid.unsqueeze(0).to(self.device),
-            )
-        if not self.use_anchor_diffusion:
-            model_kwargs.update(
-                joint_instructions=[joint_instruction or instruction],
-                agent1_instructions=[agent1_instruction] if agent1_instruction else None,
-                agent2_instructions=[agent2_instruction] if agent2_instruction else None,
-            )
-        out = self.model(**model_kwargs)
-        waypoints = out["waypoints"].detach().float().cpu().numpy()[0]
-        raw_refined_bbox = out["refined_bbox"].detach().float().cpu().numpy()[0]
-        absolute_bbox = out.get("absolute_bbox")
-        absolute_bbox = (
-            absolute_bbox.detach().float().cpu().numpy()[0]
-            if absolute_bbox is not None
-            else raw_refined_bbox.copy()
-        )
-        predicted_bbox = raw_refined_bbox.copy()
-        bbox_fallback_to_absolute = [False, False]
-        # 循环使用上一帧 bbox 时，residual head 的宽高可能逐帧收缩到 0。
-        # 退化后回退到同一模型的 absolute detection head，避免坏框永久传播。
-        if self.args.bbox_source == "model":
-            min_size = float(getattr(self.args, "bbox_min_size", 0.01))
-            for agent_idx in range(predicted_bbox.shape[0]):
-                box = predicted_bbox[agent_idx]
-                invalid = (not np.isfinite(box).all()) or float(box[2]) < min_size or float(box[3]) < min_size
-                if invalid:
-                    predicted_bbox[agent_idx] = absolute_bbox[agent_idx]
-                    bbox_fallback_to_absolute[agent_idx] = True
-        self.last_waypoints = waypoints
-        if self.args.bbox_source == "model" and not self.use_roi_tokens:
-            self.last_predicted_bbox = predicted_bbox
-        candidate_logits = out.get("candidate_logits")
-        candidate_scores = out.get("candidate_scores")
-        best_candidate = None
-        best_candidate_score = None
-        if candidate_logits is not None:
-            candidate_logits_np = candidate_logits.detach().float().cpu().numpy()[0]
-            best_candidate = candidate_logits_np.argmax(axis=-1).tolist()
-        if candidate_scores is not None and best_candidate is not None:
-            candidate_scores_np = candidate_scores.detach().float().cpu().numpy()[0]
-            best_candidate_score = [
-                float(candidate_scores_np[agent_idx, anchor_idx])
-                for agent_idx, anchor_idx in enumerate(best_candidate)
-            ]
-        return {
-            "waypoints": waypoints,
-            "bbox_input": bbox_input,
-            "bbox_source": self.args.bbox_source,
-            "visible_score": out.get("visible_score").detach().float().cpu().numpy()[0].tolist()
-            if out.get("visible_score") is not None
-            else None,
-            "refined_bbox": predicted_bbox.tolist(),
-            "raw_refined_bbox": raw_refined_bbox.tolist(),
-            "absolute_bbox": absolute_bbox.tolist(),
-            "bbox_fallback_to_absolute": bbox_fallback_to_absolute,
-            "best_candidate": best_candidate,
-            "best_candidate_score": best_candidate_score,
-            "roi_bbox_source": encode_info.get("roi_bbox_source"),
-            "evaluation_protocol": encode_info.get("evaluation_protocol"),
-            "roi_valid": encode_info.get("roi_valid"),
-            "roi_crop_xyxy": encode_info.get("roi_crop_xyxy"),
-            "roi_expand_ratio": encode_info.get("roi_expand_ratio"),
-            "roi_token_count": encode_info.get("roi_token_count"),
-            "global_encoding_time": encode_info.get("global_encoding_time"),
-            "roi_encoding_time": encode_info.get("roi_encoding_time"),
-        }
-
-    def waypoints_to_actions(
-        self,
-        waypoints: np.ndarray,
-        realtime_control_period_seconds: Optional[float] = None,
-    ) -> tuple[list[float], list[float], dict[str, Any]]:
-        """Convert model outputs to UnrealZoo actions.
-
-        Agent order follows training: agent1=drone, agent2=robotdog.
-        For robotdog, UnrealZoo only accepts [turn_deg, speed_cm_s], so the
-        predicted lateral velocity is logged but not executed.
-        """
-        default_idx = int(self.args.waypoint_index)
-        realtime_timing = bool(getattr(self.args, "realtime_waypoint_timing", False))
-        waypoint_source_dt = float(
-            getattr(self.args, "waypoint_source_dt", None) or self.args.dt
-        )
-        realtime_elapsed_raw = None
-        realtime_elapsed_clipped = None
-        if realtime_timing:
-            if bool(getattr(self.args, "deterministic_step", True)):
-                raise ValueError("--realtime-waypoint-timing requires --no-deterministic-step")
-            if realtime_control_period_seconds is None:
-                raise ValueError("Realtime waypoint timing requires an observed control period")
-            realtime_elapsed_raw = max(0.0, float(realtime_control_period_seconds))
-            realtime_elapsed_clipped = float(
-                np.clip(
-                    realtime_elapsed_raw,
-                    float(self.args.realtime_waypoint_min_seconds),
-                    float(self.args.realtime_waypoint_max_seconds),
-                )
-            )
-
-            horizon_steps = max(1, int(self.args.waypoint_horizon_steps))
-            waypoint_count = int(waypoints.shape[1])
-
-            def source_time(index: int) -> float:
-                source_step = waypoint_index_to_source_step(
-                    index,
-                    waypoint_count,
-                    horizon_steps,
-                )
-                return max(source_step * waypoint_source_dt, 1e-6)
-
-            default_idx = min(
-                range(waypoint_count),
-                key=lambda index: abs(source_time(index) - realtime_elapsed_clipped),
-            )
-        drone_idx = int(
-            np.clip(
-                default_idx
-                if realtime_timing
-                else self.args.drone_waypoint_index
-                if self.args.drone_waypoint_index is not None
-                else default_idx,
-                0,
-                waypoints.shape[1] - 1,
-            )
-        )
-        dog_idx = int(
-            np.clip(
-                default_idx
-                if realtime_timing
-                else self.args.robotdog_waypoint_index
-                if self.args.robotdog_waypoint_index is not None
-                else default_idx,
-                0,
-                waypoints.shape[1] - 1,
-            )
-        )
-        # Training integrates `waypoint_horizon_steps` actions and then
-        # resamples those points to n_waypoints outputs. Recover the source
-        # action step instead of assuming adjacent output tokens are one dt
-        # apart (the current data uses 9 source steps and 10 output points).
-        horizon_steps = max(1, int(self.args.waypoint_horizon_steps))
-        waypoint_count = int(waypoints.shape[1])
-
-        def waypoint_time(index: int) -> tuple[int, float]:
-            source_step = waypoint_index_to_source_step(
-                index,
-                waypoint_count,
-                horizon_steps,
-            )
-            return source_step, max(source_step * waypoint_source_dt, 1e-6)
-
-        drone_source_step, drone_horizon_dt = waypoint_time(drone_idx)
-        dog_source_step, dog_horizon_dt = waypoint_time(dog_idx)
-        drone_vel = waypoints[0, drone_idx, :3] / drone_horizon_dt
-        dog_vel = waypoints[1, dog_idx, :3] / dog_horizon_dt
-
-        drone_vx_raw = float(drone_vel[0] * self.args.drone_vx_scale)
-        drone_vy_raw = float(drone_vel[1] * self.args.drone_vy_scale)
-        if self.args.clip_translational_actions:
-            drone_vx = float(np.clip(drone_vx_raw, -self.args.drone_max_vx, self.args.drone_max_vx))
-            drone_vy = float(np.clip(drone_vy_raw, -self.args.drone_max_vy, self.args.drone_max_vy))
-        else:
-            drone_vx, drone_vy = drone_vx_raw, drone_vy_raw
-        # Training labels are physical body-frame velocities in m/s, while
-        # BP_drone's first three set_move_bp values are step-like
-        # displacements. The data collector applies the same velocity * dt
-        # conversion before sending its action to Unreal.
-        drone_action_dt = (
-            realtime_elapsed_clipped
-            if realtime_timing
-            else float(self.args.dt)
-        )
-        drone_yaw_unclipped = float(
-            drone_vel[2] * self.args.drone_yaw_sign * self.args.drone_yaw_scale
-        )
-        drone_w = float(
-            np.clip(
-                drone_yaw_unclipped,
-                -self.args.drone_max_yaw_rate,
-                self.args.drone_max_yaw_rate,
-            )
-        )
-        drone_action = [
-            drone_vx * drone_action_dt,
-            drone_vy * drone_action_dt,
-            0.0,
-            drone_w,
-        ]
-
-        dog_speed_raw = float(
-            dog_vel[0] * UNREAL_UNITS_PER_METER * float(self.args.robotdog_speed_gain)
-        )
-        dog_speed = (
-            float(
-                np.clip(
-                    dog_speed_raw,
-                    -self.args.robotdog_max_speed * UNREAL_UNITS_PER_METER,
-                    self.args.robotdog_max_speed * UNREAL_UNITS_PER_METER,
-                )
-            )
-            if self.args.clip_translational_actions
-            else dog_speed_raw
-        )
-        dog_turn = float(
-            np.clip(
-                math.degrees(
-                    dog_vel[2]
-                    * self.args.robotdog_yaw_sign
-                    * self.args.robotdog_yaw_scale
-                    * drone_action_dt
-                ),
-                -self.args.robotdog_max_turn_deg,
-                self.args.robotdog_max_turn_deg,
-            )
-        )
-        dog_action = [dog_turn, dog_speed]
-
-        debug = {
-            "waypoint_index": default_idx,
-            "drone_waypoint_index": drone_idx,
-            "robotdog_waypoint_index": dog_idx,
-            "waypoint_horizon_steps": horizon_steps,
-            "waypoint_source_dt_seconds": waypoint_source_dt,
-            "drone_waypoint_source_step": drone_source_step,
-            "robotdog_waypoint_source_step": dog_source_step,
-            "action_source": "derived_from_model_waypoints",
-            "drone_horizon_dt": float(drone_horizon_dt),
-            "robotdog_horizon_dt": float(dog_horizon_dt),
-            "drone_waypoint": [float(v) for v in waypoints[0, drone_idx, :3].tolist()],
-            "robotdog_waypoint": [float(v) for v in waypoints[1, dog_idx, :3].tolist()],
-            "drone_velocity_pred": [float(v) for v in drone_vel.tolist()],
-            "drone_physical_velocity_command": [float(drone_vx), float(drone_vy), 0.0],
-            "drone_action_dt_seconds": float(drone_action_dt),
-            "drone_translation_action_space": "step_like_displacement",
-            "robotdog_velocity_pred": [float(v) for v in dog_vel.tolist()],
-            "drone_yaw_scale": float(self.args.drone_yaw_scale),
-            "drone_yaw_unclipped": float(drone_yaw_unclipped),
-            "drone_yaw_command": float(drone_w),
-            "clip_translational_actions": bool(self.args.clip_translational_actions),
-            "robotdog_speed_gain": float(self.args.robotdog_speed_gain),
-            "robotdog_yaw_scale": float(self.args.robotdog_yaw_scale),
-            "robotdog_turn_dt_seconds": float(drone_action_dt),
-            "robotdog_lateral_ignored": float(dog_vel[1]),
-            "realtime_waypoint_timing": realtime_timing,
-            "realtime_timing_source": "previous_observation_interval_wall_clock" if realtime_timing else None,
-            "realtime_control_period_seconds_raw": realtime_elapsed_raw,
-            "realtime_control_period_seconds_clipped": realtime_elapsed_clipped,
-            # Compatibility aliases for results produced by the first realtime implementation.
-            "realtime_elapsed_seconds_raw": realtime_elapsed_raw,
-            "realtime_elapsed_seconds_clipped": realtime_elapsed_clipped,
-        }
-        return drone_action, dog_action, debug
-
-
-# ----------------------- Episode 初始化与观测读取 -----------------------
 
 def align_ideal_follow_distances(args: argparse.Namespace) -> dict[str, float]:
-    """Use each configured follow range midpoint as the spawn distance."""
+    """Resolve the follower spawn distances used by place_initial_followers."""
     values: dict[str, float] = {}
+    shared_init_dist = getattr(args, "init_follower_distance", None)
+    if shared_init_dist is not None and float(shared_init_dist) <= 0.0:
+        shared_init_dist = None
     for agent in ("robotdog", "drone"):
         min_dist = float(getattr(args, f"{agent}_min_follow_dist"))
         max_dist = float(getattr(args, f"{agent}_max_follow_dist"))
@@ -1272,7 +1036,17 @@ def align_ideal_follow_distances(args: argparse.Namespace) -> dict[str, float]:
             raise ValueError(
                 f"Invalid {agent} follow range: min={min_dist}, max={max_dist}"
             )
-        ideal_dist = 0.5 * (min_dist + max_dist)
+        agent_init_dist = getattr(args, f"init_{agent}_distance", None)
+        if agent_init_dist is not None:
+            if float(agent_init_dist) <= 0.0:
+                raise ValueError(f"Invalid {agent} init distance: {agent_init_dist}")
+            ideal_dist = float(agent_init_dist)
+        elif shared_init_dist is not None:
+            ideal_dist = float(shared_init_dist)
+        else:
+            ideal_dist = 0.5 * (min_dist + max_dist)
+        if ideal_dist <= 0.0:
+            raise ValueError(f"Invalid {agent} init distance: {ideal_dist}")
         setattr(args, f"{agent}_ideal_follow_dist", ideal_dist)
         values[agent] = ideal_dist
     return values
@@ -1292,9 +1066,22 @@ def setup_episode(
                 unrealcv.set_resume()
             except Exception:
                 pass
-    reset_env(env, args)
-    target_id, robotdog_id, drone_id = classify_coop_agents(env)
-    env.unwrapped.target_id = target_id
+    reset_env(env, args)  # 重置环境
+    replay_meta = (target_trajectory or {}).get("replay_meta") or {}
+    replay_distractor_count = int(replay_meta.get("distractor_count") or len(replay_meta.get("distractors") or []))
+    if target_trajectory is not None and replay_distractor_count > 0:
+        # Expand the UE population to the recorded target + distractors before
+        # selecting cameras.  The follower IDs stay 1 (dog) and 2 (drone).
+        env.unwrapped.agents_category = ["player", "player", "drone"] + [
+            "player"
+        ] * replay_distractor_count
+        env.unwrapped.set_population(3 + replay_distractor_count)
+        target_id, robotdog_id, drone_id = 0, 1, 2
+        replay_distractor_ids = list(range(3, 3 + replay_distractor_count))
+    else:
+        target_id, robotdog_id, drone_id = classify_coop_agents(env)  # 确定环境对象
+        replay_distractor_ids = []
+    env.unwrapped.target_id = target_id  #
     env.unwrapped.tracker_id = drone_id
     env.unwrapped.protagonist_id = drone_id
     players = env.unwrapped.player_list
@@ -1314,6 +1101,42 @@ def setup_episode(
     )
 
     appearances = set_episode_appearances(env, target_id, robotdog_id, [], rng, args)
+    replay_appearance_map = replay_meta.get("appearance_map") or {}
+    if target_trajectory is not None and replay_appearance_map:
+        # Replay metadata names the exact actor slots used during AT rerender.
+        # Keep distractor appearances deterministic instead of randomizing them.
+        for actor_name, appearance_id in replay_appearance_map.items():
+            if actor_name in players:
+                env.unwrapped.unrealcv.set_appearance(
+                    actor_name, int(appearance_id)
+                )
+    if target_trajectory is not None and replay_distractor_ids:
+        human_appearance_ids = list(replay_meta.get("human_appearance_ids") or [])
+        for ordinal, actor_id in enumerate([target_id, *replay_distractor_ids]):
+            if ordinal < len(human_appearance_ids):
+                env.unwrapped.unrealcv.set_appearance(
+                    players[actor_id], int(human_appearance_ids[ordinal])
+                )
+        first_distractors = replay_meta.get("distractor_poses_per_frame") or []
+        if first_distractors and isinstance(first_distractors[0], dict):
+            for ordinal, actor_id in enumerate(replay_distractor_ids):
+                if ordinal >= len(first_distractors[0]):
+                    break
+                pose = list(first_distractors[0].values())[ordinal]
+                if isinstance(pose, list) and len(pose) >= 3:
+                    env.unwrapped.unrealcv.set_obj_location(players[actor_id], pose[:3])
+                    if len(pose) >= 6:
+                        env.unwrapped.unrealcv.set_obj_rotation(players[actor_id], pose[3:6])
+                try:
+                    env.unwrapped.unrealcv.set_max_speed(
+                        players[actor_id],
+                        float(args.environment_ground_max_speed_mps) * UNREAL_UNITS_PER_METER,
+                    )
+                    env.unwrapped.unrealcv.set_acceleration(
+                        players[actor_id], float(args.ground_acceleration)
+                    )
+                except Exception:
+                    pass
     if target_trajectory is not None:
         first_pose = target_trajectory["poses"][0]
         env.unwrapped.unrealcv.set_obj_location(target_name, first_pose[:3])
@@ -1353,8 +1176,14 @@ def setup_episode(
     # Use the first path segment only for fallback follower placement. A
     # recorded episode keeps its authored target rotation, as Habitat does.
     initial_motion_goal = target_goal
-    if target_trajectory is not None and replay_mode == "path_goal" and len(target_path) >= 2:
-        initial_motion_goal = list(target_path[1])
+    if target_trajectory is not None and len(target_path) >= 2:
+        first_xy = np.asarray(target_path[0][:2], dtype=np.float64)
+        for candidate in target_path[1:]:
+            if float(np.linalg.norm(np.asarray(candidate[:2], dtype=np.float64) - first_xy)) > 1e-3:
+                # This pose is used only for initialization direction. Action
+                # replay never teleports the target to recorded future poses.
+                initial_motion_goal = list(candidate)
+                break
     goal_direction = np.asarray(initial_motion_goal[:2]) - np.asarray(target_pose[:2])
     if target_trajectory is None and np.linalg.norm(goal_direction) > 1e-6:
         target_yaw = math.degrees(math.atan2(float(goal_direction[1]), float(goal_direction[0])))
@@ -1363,13 +1192,22 @@ def setup_episode(
         except Exception:
             pass
     try:
+        # Use the same unrestrictive BP ceiling and acceleration as the
+        # verified fixed-step replay.  Movement is still determined by the
+        # per-step action; this prevents UE from silently clipping it or
+        # adding a random/default acceleration ramp.
         target_speed = (
             0.0
-            if target_trajectory is not None and replay_mode in {"pose", "path_goal"}
-            else float(args.human_speed)
+            if target_trajectory is not None and replay_mode == "path_goal"
+            else float(args.environment_ground_max_speed_mps) * UNREAL_UNITS_PER_METER
         )
         env.unwrapped.unrealcv.set_max_speed(target_name, target_speed)
-        env.unwrapped.unrealcv.set_max_speed(robotdog_name, float(args.robotdog_max_speed) * UNREAL_UNITS_PER_METER)
+        env.unwrapped.unrealcv.set_max_speed(
+            robotdog_name,
+            float(args.environment_ground_max_speed_mps) * UNREAL_UNITS_PER_METER,
+        )
+        env.unwrapped.unrealcv.set_acceleration(target_name, float(args.ground_acceleration))
+        env.unwrapped.unrealcv.set_acceleration(robotdog_name, float(args.ground_acceleration))
     except Exception:
         pass
 
@@ -1397,12 +1235,18 @@ def setup_episode(
         else {"robotdog": False, "drone": False}
     )
     if use_recorded_agent_poses and not all(restored_agent_poses.values()):
-        raise EpisodeSkipped(
-            "recorded Habitat-style initialization requires both drone and "
-            f"robotdog poses, got {restored_agent_poses}"
+        # Establish a valid fallback for both agents, then overwrite whichever
+        # recorded poses are available. Keep the restored flags for auditing.
+        place_initial_followers(env, target_id, robotdog_id, drone_id, initial_motion_goal, args)
+        restored_agent_poses = restore_recorded_agent_initial_poses(
+            env,
+            args,
+            robotdog_name,
+            drone_name,
+            target_trajectory,
         )
     if target_trajectory is not None:
-        if replay_mode in {"pose", "path_goal"}:
+        if replay_mode == "path_goal":
             # Keep the recorded start pose fixed until frame 0 has been consumed.
             first_pose = target_trajectory["poses"][0]
             _set_recorded_target_pose(
@@ -1427,6 +1271,42 @@ def setup_episode(
         env.unwrapped.unrealcv.set_pause()
         if not env.unwrapped.unrealcv.get_is_paused():
             raise RuntimeError("Unreal setup failed to pause the world")
+
+    # Placement commands above are issued while UE is live so reset-time actor
+    # changes can settle. Re-apply the authored first-frame state after the
+    # pause barrier so residual BP velocity cannot shift the actual frame-0
+    # observation away from the recording.
+    if target_trajectory is not None and replay_mode != "nav_goal":
+        _set_recorded_target_pose(
+            env,
+            {"target_name": target_name},
+            target_trajectory["poses"][0],
+        )
+    if use_recorded_agent_poses:
+        restored_agent_poses = restore_recorded_agent_initial_poses(
+            env,
+            args,
+            robotdog_name,
+            drone_name,
+            target_trajectory,
+        )
+        if not all(restored_agent_poses.values()):
+            place_initial_followers(
+                env,
+                target_id,
+                robotdog_id,
+                drone_id,
+                initial_motion_goal,
+                args,
+            )
+            restored_agent_poses = restore_recorded_agent_initial_poses(
+                env,
+                args,
+                robotdog_name,
+                drone_name,
+                target_trajectory,
+            )
+        update_observation(env, refresh_cameras=True)
 
     dog_cfg = dog_args(args)
     drone_cfg = drone_args(args)
@@ -1534,7 +1414,68 @@ def setup_episode(
             else [target_goal]
         ),
         "target_path": target_path,
-        "target_replay_mode": replay_mode if target_trajectory is not None else None,
+        "instruction": target_trajectory.get("instruction") if target_trajectory is not None else None,
+        "replay_distractor_ids": replay_distractor_ids,
+        "replay_distractor_names": [players[index] for index in replay_distractor_ids],
+                "target_replay_mode": replay_mode if target_trajectory is not None else None,
+        "replay_distractors": bool(target_trajectory is not None and replay_meta.get("distractor_poses_per_frame")),
+        "replay_distractor_count": int(len(replay_meta.get("distractors") or [])),
+        "replay_distractor_motion_policy": (
+            replay_meta.get("target_motion_source")
+            if target_trajectory is not None
+            else None
+        ),
+        "ue_interval_ms": int(getattr(args, "ue_interval_ms", None) or round(float(args.dt) * 1000.0)),
+        "bp_interval_s": float(getattr(args, "ue_interval_ms", None) or round(float(args.dt) * 1000.0)) / 1000.0,
+        "velocity_feedback": {
+            "drone_translation_gain": float(args.drone_velocity_feedback_gain),
+            "drone_yaw_gain": float(args.drone_yaw_feedback_gain),
+            "drone_max_translation": float(args.drone_feedback_max_translation),
+            "drone_max_yaw_rate": float(args.drone_feedback_max_yaw_rate),
+            "robotdog_translation_gain": float(args.robotdog_velocity_feedback_gain),
+            "robotdog_yaw_gain": float(args.robotdog_yaw_feedback_gain),
+            "robotdog_max_translation": float(args.robotdog_feedback_max_translation),
+            "robotdog_max_yaw_rate": float(args.robotdog_feedback_max_yaw_rate),
+        },
+        "action_gain": {
+            "drone_speed": float(args.drone_speed_gain),
+            "drone_yaw": float(args.drone_yaw_scale),
+            "robotdog_speed": float(args.robotdog_speed_gain),
+            "robotdog_yaw": float(args.robotdog_yaw_scale),
+        },
+        "action_selection": {
+            "waypoint_control_mode": str(args.waypoint_control_mode),
+            "waypoint_index": int(args.waypoint_index),
+            "drone_waypoint_index": int(
+                args.drone_waypoint_index
+                if args.drone_waypoint_index is not None
+                else args.waypoint_index
+            ),
+            "robotdog_waypoint_index": int(
+                args.robotdog_waypoint_index
+                if args.robotdog_waypoint_index is not None
+                else args.waypoint_index
+            ),
+            "waypoint_horizon_steps": int(args.waypoint_horizon_steps),
+            "waypoint_source_dt_s": float(args.waypoint_source_dt or args.dt),
+            "ground_translation_delay_steps": int(args.ground_translation_delay_steps),
+            "ground_yaw_gain": float(args.ground_yaw_gain),
+            "drone_inverse_coefficients": {
+                "a_forward": float(args.drone_inverse_a_forward),
+                "b_forward": float(args.drone_inverse_b_forward),
+                "a_lateral": float(args.drone_inverse_a_lateral),
+                "b_lateral": float(args.drone_inverse_b_lateral),
+                "yaw_a": float(args.drone_inverse_yaw_a),
+                "yaw_b": float(args.drone_inverse_yaw_b),
+            },
+            "inverse_command_smoothing": {
+                "drone_xy_alpha": float(args.drone_inverse_xy_smoothing_alpha),
+                "drone_yaw_alpha": float(args.drone_inverse_yaw_smoothing_alpha),
+                "robotdog_speed_alpha": float(args.robotdog_inverse_speed_smoothing_alpha),
+                "robotdog_yaw_alpha": float(args.robotdog_inverse_yaw_smoothing_alpha),
+            },
+            "state_feedback": "none_internal_command_rollout" if args.waypoint_control_mode == "inverse_fixed_dt" else "legacy_pose_velocity_feedback",
+        },
         "target_path_sampling": {
             "source": "test_json_target_pose" if target_trajectory is not None else "simulator_navigation",
             "min_spacing_unreal_units": float(getattr(args, "target_path_min_spacing", 100.0)),
@@ -1548,11 +1489,13 @@ def setup_episode(
         "init_from_recorded_agent_poses": bool(getattr(args, "init_from_recorded_agent_poses", False)),
         "init_followers_behind_target": init_followers_behind_target,
         "init_agent_pose_policy": (
-            "behind_target_midrange"
+            "behind_target_fixed_distance"
             if init_followers_behind_target
             else "recorded_agent_poses"
+            if use_recorded_agent_poses and all(restored_agent_poses.values())
+            else "recorded_agent_poses_with_ideal_fallback"
             if use_recorded_agent_poses
-            else "behind_target_midrange_fallback"
+            else "behind_target_fixed_distance_fallback"
         ),
         "restored_recorded_agent_poses": restored_agent_poses,
         "restored_recorded_agent_cameras": restored_agent_cameras,
@@ -1596,11 +1539,87 @@ def setup_episode(
 
 
 def _target_replay_mode(args: argparse.Namespace) -> str:
-    return str(getattr(args, "target_replay_mode", "pose"))
+    # Teleport-based target replay modes are intentionally unsupported.
+    mode = str(getattr(args, "target_replay_mode", "action"))
+    if mode not in {"nav_goal", "action", "path_goal"}:
+        raise ValueError(
+            f"unsupported target replay mode {mode!r}; use action, path_goal, or nav_goal"
+        )
+    return mode
 
 
 def _wrap_degrees(degrees: float) -> float:
     return float((degrees + 180.0) % 360.0 - 180.0)
+
+
+def measured_body_velocity(
+    pose_before: list[float],
+    pose_after: list[float],
+    dt_seconds: float,
+) -> list[float]:
+    """Measure body-frame [vx, vy, yaw_rate] from one action pulse."""
+    dt_seconds = max(float(dt_seconds), 1e-6)
+    delta_xy_m = (pose_xyz(pose_after)[:2] - pose_xyz(pose_before)[:2]) / UNREAL_UNITS_PER_METER
+    yaw = math.radians(yaw_deg(pose_before))
+    forward = np.asarray([math.cos(yaw), math.sin(yaw)], dtype=np.float64)
+    right = np.asarray([-math.sin(yaw), math.cos(yaw)], dtype=np.float64)
+    return [
+        float(np.dot(delta_xy_m, forward) / dt_seconds),
+        float(np.dot(delta_xy_m, right) / dt_seconds),
+        float(math.radians(_wrap_degrees(yaw_deg(pose_after) - yaw_deg(pose_before))) / dt_seconds),
+    ]
+
+
+def apply_oracle_heading_assist(
+    args: argparse.Namespace,
+    drone_pose: list[float],
+    dog_pose: list[float],
+    target_pose: list[float],
+    drone_action: list[float],
+    dog_action: list[float],
+    action_debug: dict[str, Any],
+) -> None:
+    """Debug assist: keep model translation, replace yaw/turn from target bearing."""
+    if not bool(getattr(args, "oracle_heading_assist", False)):
+        return
+
+    drone_error_deg = _wrap_degrees(
+        heading_deg(pose_xyz(drone_pose), pose_xyz(target_pose)) - yaw_deg(drone_pose)
+    )
+    dog_error_deg = _wrap_degrees(
+        heading_deg(pose_xyz(dog_pose), pose_xyz(target_pose)) - yaw_deg(dog_pose)
+    )
+    drone_yaw = float(
+        np.clip(
+            math.radians(drone_error_deg) * float(args.drone_heading_assist_gain),
+            -float(args.drone_max_yaw_rate),
+            float(args.drone_max_yaw_rate),
+        )
+    )
+    dog_turn = float(
+        np.clip(
+            dog_error_deg * float(args.robotdog_heading_assist_gain),
+            -float(args.robotdog_max_turn_deg),
+            float(args.robotdog_max_turn_deg),
+        )
+    )
+    model_drone_yaw = float(drone_action[3])
+    model_dog_turn = float(dog_action[0])
+    drone_action[3] = drone_yaw
+    dog_action[0] = dog_turn
+    action_debug.update(
+        {
+            "oracle_heading_assist": True,
+            "drone_model_yaw_command_before_assist": model_drone_yaw,
+            "robotdog_model_turn_before_assist": model_dog_turn,
+            "drone_heading_error_deg": float(drone_error_deg),
+            "robotdog_heading_error_deg": float(dog_error_deg),
+            "drone_heading_assist_gain": float(args.drone_heading_assist_gain),
+            "robotdog_heading_assist_gain": float(args.robotdog_heading_assist_gain),
+            "drone_yaw_command_after_assist": float(drone_yaw),
+            "robotdog_turn_after_assist": float(dog_turn),
+        }
+    )
 
 
 def _target_path_waypoints(trajectory: dict[str, Any], args: argparse.Namespace) -> list[list[float]]:
@@ -1797,7 +1816,7 @@ def update_habitat_target_stop_state(
         return True
 
     replay_mode = setup.get("target_replay_mode")
-    reached = bool(replay_mode == "pose" and recorded_pose_exhausted)
+    reached = bool(replay_mode == "action" and recorded_pose_exhausted)
     final_goal: Optional[list[float]] = None
     if replay_mode == "path_goal":
         path = setup.get("target_path_waypoints") or []
@@ -1809,7 +1828,7 @@ def update_habitat_target_stop_state(
                 reached = bool(setup.get("target_path_completed", False)) or int(
                     setup.get("target_path_index", 0)
                 ) >= len(path) - 1
-    elif replay_mode != "pose":
+    elif replay_mode != "action":
         final_goal = setup.get("target_goal")
 
     skip_final_distance_check = bool(
@@ -1879,41 +1898,44 @@ def deterministic_data_collection_step(
     drone_action: list[float],
     dog_action: list[float],
     target_action: Any = None,
+    distractor_actions: Optional[list[Any]] = None,
 ):
     """Advance exactly one fixed-delta UE frame and return paused observations."""
     unrealcv = env.unwrapped.unrealcv
-    if not unrealcv.get_is_paused():
+    pause_check_stride = int(
+        getattr(args, "deterministic_pause_check_stride", 1) or 0
+    )
+    verify_pause = bool(
+        pause_check_stride > 0
+        and int(env.unwrapped.count_steps) % pause_check_stride == 0
+    )
+    if verify_pause and not unrealcv.get_is_paused():
         raise RuntimeError("Unreal world advanced outside deterministic step: expected paused state")
 
     commands = [
         unrealcv.set_move_bp(setup["drone_name"], drone_action, return_cmd=True),
         unrealcv.set_move_bp(setup["robotdog_name"], dog_action, return_cmd=True),
     ]
-    if target_action is not None:
+    if target_action is not None or distractor_actions:
         actions = [None for _ in env.unwrapped.player_list]
-        actions[setup["target_id"]] = target_action
+        if target_action is not None:
+            actions[setup["target_id"]] = target_action
+        for actor_id, action in zip(
+            setup.get("replay_distractor_ids", []), distractor_actions or []
+        ):
+            actions[actor_id] = action_for_target_space(env, actor_id, action)
         actions2move, actions2turn, actions2animate = env.unwrapped.action_mapping(
             actions, env.unwrapped.player_list
         )
-        target_id = setup["target_id"]
-        target_name = setup["target_name"]
-        if actions2move[target_id] is not None:
-            commands.append(
-                unrealcv.set_move_bp(target_name, actions2move[target_id], return_cmd=True)
-            )
-        if actions2turn[target_id] is not None:
-            commands.append(
-                unrealcv.set_cam(
-                    target_name,
-                    env.unwrapped.agents[target_name]["relative_location"],
-                    actions2turn[target_id],
-                    return_cmd=True,
-                )
-            )
-        if actions2animate[target_id] is not None:
-            commands.append(
-                unrealcv.set_animation(target_name, actions2animate[target_id], return_cmd=True)
-            )
+        actor_ids = [setup["target_id"]] + list(setup.get("replay_distractor_ids", []))
+        for actor_id in actor_ids:
+            actor_name = env.unwrapped.player_list[actor_id]
+            if actions2move[actor_id] is not None:
+                commands.append(unrealcv.set_move_bp(actor_name, actions2move[actor_id], return_cmd=True))
+            if actions2turn[actor_id] is not None:
+                commands.append(unrealcv.set_cam(actor_name, env.unwrapped.agents[actor_name]["relative_location"], actions2turn[actor_id], return_cmd=True))
+            if actions2animate[actor_id] is not None:
+                commands.append(unrealcv.set_animation(actor_name, actions2animate[actor_id], return_cmd=True))
     unrealcv.batch_cmd(commands, None)
     pulse_t0 = time.monotonic()
     # UnrealCV dispatches these game commands on successive fixed-delta
@@ -1922,11 +1944,21 @@ def deterministic_data_collection_step(
     unrealcv.set_resume()
     unrealcv.set_pause()
     pulse_wall_seconds = time.monotonic() - pulse_t0
-    if not unrealcv.get_is_paused():
+    if verify_pause and not unrealcv.get_is_paused():
         raise RuntimeError("Unreal deterministic step failed to return to paused state")
 
     idle_actions = [None for _ in env.unwrapped.player_list]
-    obs, rewards, done, info = data_collection_step(env, idle_actions)
+    if bool(getattr(args, "fast_eval_io", False)):
+        # The action pulse above already advanced the paused world.  Only the
+        # resulting object poses are needed here for realized velocity,
+        # collision and following-distance metrics.  The legacy base step also
+        # renders every camera even though those post-action images are thrown
+        # away before the next observation snapshot.
+        obs, rewards, done, info = data_collection_step_pose_only(
+            env, idle_actions
+        )
+    else:
+        obs, rewards, done, info = data_collection_step(env, idle_actions)
     info["Action"] = [
         drone_action
         if idx == setup["drone_id"]
@@ -1991,25 +2023,132 @@ def _read_agent_pair(
     env,
     setup: dict[str, Any],
     args: argparse.Namespace,
+    *,
+    include_rgb: bool = True,
+    include_mask: bool = True,
 ) -> tuple[
-    tuple[np.ndarray, float, bool, list[int], list[float]],
-    tuple[np.ndarray, float, bool, list[int], list[float]],
+    tuple[Optional[np.ndarray], Optional[float], Optional[bool], Optional[list[int]], Optional[list[float]]],
+    tuple[Optional[np.ndarray], Optional[float], Optional[bool], Optional[list[int]], Optional[list[float]]],
 ]:
-    """Batch poses, both RGB views and masks into one realtime snapshot."""
-    obs, masks = capture_color_mask_snapshot(env, include_masks=True)
+    """Batch poses, follower masks and optionally RGB into one snapshot."""
+    fast_eval_io = bool(getattr(args, "fast_eval_io", False))
+    if fast_eval_io:
+        # V3 consumes only the drone and RobotDog views.  Keep all player poses
+        # in the same batch for metric/control alignment, but do not render the
+        # target or global cameras.  Masks remain enabled because visibility
+        # and bbox IoU are evaluation metrics.
+        unwrapped = env.unwrapped
+        follower_ids = (setup["drone_id"], setup["robotdog_id"])
+        follower_cams = [unwrapped.cam_list[index] for index in follower_ids]
+        reuse_post_action_poses = bool(
+            getattr(args, "reuse_post_action_poses", False)
+        )
+        if reuse_post_action_poses and not include_rgb and not include_mask:
+            obj_poses, imgs, masks = [], [], []
+        else:
+            obj_poses, _cam_poses, imgs, masks, _depths = (
+                unwrapped.unrealcv.get_pose_img_batch(
+                    unwrapped.player_list,
+                    follower_cams,
+                    [False, bool(include_rgb), bool(include_mask), False],
+                    mask_mode=str(getattr(args, "mask_image_format", "png")),
+                    include_obj_pose=not reuse_post_action_poses,
+                )
+            )
+        if obj_poses:
+            unwrapped.obj_poses = obj_poses
+        obs_by_agent = (
+            {
+                agent_id: imgs[pair_index]
+                for pair_index, agent_id in enumerate(follower_ids)
+            }
+            if include_rgb
+            else {}
+        )
+        masks_by_agent = (
+            {
+                agent_id: masks[pair_index]
+                for pair_index, agent_id in enumerate(follower_ids)
+            }
+            if include_mask
+            else {}
+        )
+    else:
+        obs, masks = capture_color_mask_snapshot(env, include_masks=True)
 
-    def read_one(agent_id: int) -> tuple[np.ndarray, float, bool, list[int], list[float]]:
-        frame = ensure_bgr_uint8(obs[agent_id])
+    def read_one(
+        agent_id: int,
+    ) -> tuple[Optional[np.ndarray], Optional[float], Optional[bool], Optional[list[int]], Optional[list[float]]]:
+        frame = (
+            ensure_bgr_uint8(
+                obs_by_agent[agent_id] if fast_eval_io else obs[agent_id]
+            )
+            if include_rgb
+            else None
+        )
+        if not include_mask:
+            return frame, None, None, None, None
         visibility, visible, bbox = target_mask_visibility(
             env,
             env.unwrapped.cam_list[agent_id],
             setup["target_name"],
-            mask_img=masks[agent_id],
+            mask_img=(
+                masks_by_agent[agent_id]
+                if fast_eval_io
+                else masks[agent_id]
+            ),
         )
         bbox_norm = _normalize_bbox_xywh(bbox, args.width, args.height)
         return frame, float(visibility), bool(visible), bbox, bbox_norm
 
     return read_one(setup["drone_id"]), read_one(setup["robotdog_id"])
+
+
+def _rollout_future_waypoint_segment(
+    waypoints: Any,
+    offset: int,
+) -> np.ndarray:
+    """Rebase a cached ego-frame trajectory at a later physics step.
+
+    The model trajectory is origin-inclusive and expressed in the body frame
+    at its policy observation.  On a held policy step, convert the remaining
+    future path into the body frame at ``offset`` so the inverse controller
+    consumes the next predicted segment instead of repeating the first action.
+    """
+
+    values = np.asarray(waypoints, dtype=np.float32)
+    if values.ndim != 3 or values.shape[0] != 2 or values.shape[2] < 3:
+        raise ValueError(
+            "Policy waypoints must have shape (2,N,D>=3), got "
+            f"{values.shape}"
+        )
+    count = int(values.shape[1])
+    anchor_index = int(np.clip(offset, 0, max(count - 1, 0)))
+    if anchor_index == 0:
+        return values.copy()
+    source_indices = np.clip(
+        np.arange(count, dtype=np.int64) + anchor_index,
+        0,
+        count - 1,
+    )
+    rebased = values[:, source_indices].copy()
+    for agent_id in range(values.shape[0]):
+        anchor = values[agent_id, anchor_index]
+        delta_xy = rebased[agent_id, :, :2] - anchor[:2]
+        yaw = float(anchor[2])
+        cosine = math.cos(yaw)
+        sine = math.sin(yaw)
+        x_local = cosine * delta_xy[:, 0] + sine * delta_xy[:, 1]
+        y_local = -sine * delta_xy[:, 0] + cosine * delta_xy[:, 1]
+        rebased[agent_id, :, 0] = x_local
+        rebased[agent_id, :, 1] = y_local
+        yaw_delta = rebased[agent_id, :, 2] - yaw
+        rebased[agent_id, :, 2] = np.arctan2(
+            np.sin(yaw_delta),
+            np.cos(yaw_delta),
+        )
+        rebased[agent_id, 0, :3] = 0.0
+    return rebased
 
 
 # ----------------------- 单 Episode 闭环评估 -----------------------
@@ -2038,11 +2177,44 @@ def run_episode(
     lost_count = 0
     failure_count = 0
     collision = False
+    # Keep UE contact diagnostics separate, but make the primary episode
+    # collision follow the configured evaluation rule below.
+    physical_collision = False
+    # Habitat-style episode metric: once either follower comes within the
+    # configured distance of the human, the metric stays 1 for this episode.
+    # This is deliberately separate from the UE physical collision flag.
+    human_collision = False
+    drone_human_collision = False
+    robotdog_human_collision = False
     status = "Normal"
     t0 = time.monotonic()
+    # Pure neural-network forward latency: starts immediately before the
+    # planner/model call and ends when its output tensor is returned. This is
+    # intentionally separate from camera/UE I/O, preprocessing, perception,
+    # feature encoding, routing, action conversion, IPC and video writing.
+    model_inference_seconds_total = 0.0
+    model_inference_steps = 0
     last_info = None
     previous_observation_wall_time: Optional[float] = None
     planner_debug_steps = max(0, int(getattr(args, "planner_debug_steps", 0) or 0))
+    policy_inference_stride = int(getattr(args, "policy_inference_stride", 1) or 1)
+    if policy_inference_stride < 1:
+        raise ValueError("--policy-inference-stride must be >= 1")
+    skip_rgb_between_policy_steps = bool(
+        getattr(args, "skip_rgb_between_policy_steps", True)
+    )
+    metric_mask_stride = int(getattr(args, "metric_mask_stride", 1) or 1)
+    if metric_mask_stride < 1:
+        raise ValueError("--metric-mask-stride must be >= 1")
+    cached_policy_prediction: Optional[dict[str, Any]] = None
+    cached_drone_action: Optional[list[float]] = None
+    cached_dog_action: Optional[list[float]] = None
+    cached_action_debug: Optional[dict[str, Any]] = None
+    cached_policy_waypoints: Optional[np.ndarray] = None
+    cached_drone_frame: Optional[np.ndarray] = None
+    cached_dog_frame: Optional[np.ndarray] = None
+    cached_drone_mask_metrics: Optional[tuple[float, bool, list[int], list[float]]] = None
+    cached_dog_mask_metrics: Optional[tuple[float, bool, list[int], list[float]]] = None
 
     # Recorded path length no longer terminates the episode immediately. As in
     # Habitat, the target can stop at its final goal while the followers keep
@@ -2053,9 +2225,6 @@ def run_episode(
         loop_start_monotonic = time.monotonic()
         if bool(setup.get("target_stopped", False)):
             update_habitat_target_stop_state(env, args, setup, step_idx=step_idx)
-        elif target_trajectory is not None and target_replay_mode == "pose":
-            current_pose = target_trajectory["poses"][min(step_idx, len(target_trajectory["poses"]) - 1)]
-            _set_recorded_target_pose(env, setup, current_pose)
         elif target_trajectory is not None and target_replay_mode == "path_goal":
             update_recorded_path_navigation(env, args, setup)
         target_stopped = update_habitat_target_stop_state(
@@ -2065,7 +2234,7 @@ def run_episode(
             step_idx=step_idx,
             recorded_pose_exhausted=bool(
                 target_trajectory is not None
-                and target_replay_mode == "pose"
+                and target_replay_mode == "action"
                 and step_idx >= len(target_trajectory["poses"]) - 1
             ),
         )
@@ -2076,6 +2245,29 @@ def run_episode(
                 if target_stopped
                 else target_path_step_action(env, args, setup)
             )
+        elif target_trajectory is not None and target_replay_mode == "action":
+            if target_stopped:
+                target_action = _target_stop_action(env, setup)
+                setup["target_path_action_debug"] = {
+                    "policy": f"recorded_{target_replay_mode}",
+                    "fallback": "target_stopped",
+                }
+            else:
+                raw_target_action, target_action_debug = recorded_target_action_for_step(
+                    target_trajectory,
+                    args,
+                    step_idx,
+                    current_pose=list(env.unwrapped.obj_poses[setup["target_id"]]),
+                )
+                target_action = (
+                    action_for_target_space(env, setup["target_id"], raw_target_action)
+                    if raw_target_action is not None
+                    else None
+                )
+                setup["target_path_action_debug"] = {
+                    "policy": f"recorded_{target_replay_mode}",
+                    **target_action_debug,
+                }
         target_pose_before = list(env.unwrapped.obj_poses[setup["target_id"]])
         if args.face_target_before_step:
             # Legacy dog-only oracle heading. Drone yaw must remain model-action
@@ -2086,9 +2278,38 @@ def run_episode(
                 heading_deg(pose_xyz(list(env.unwrapped.obj_poses[setup["robotdog_id"]])), pose_xyz(target_pose_before)),
             )
 
-        _lock_eval_cameras(env, setup, args)
+        policy_inference_step = (
+            cached_policy_prediction is None
+            or step_idx % policy_inference_stride == 0
+        )
+        intermediate_observation_step = bool(
+            not policy_inference_step
+            and getattr(planner, "supports_intermediate_observation", False)
+        )
+        # V3 的训练历史间隔是 0.1 s。即使 Qwen 每 5 步才运行一次，中间物理步
+        # 仍需读取 RGB 并只更新视觉历史，不能把 0.5 s 稀疏帧伪装成 0.1 s 历史。
+        include_policy_rgb = bool(
+            policy_inference_step
+            or intermediate_observation_step
+            or not skip_rgb_between_policy_steps
+        )
+        metric_mask_step = bool(
+            cached_drone_mask_metrics is None
+            or cached_dog_mask_metrics is None
+            or step_idx % metric_mask_stride == 0
+            # Terminal success must use a current, not held, visibility mask.
+            or target_stopped
+        )
+        if include_policy_rgb or metric_mask_step:
+            _lock_eval_cameras(env, setup, args)
         snapshot_start_monotonic = time.monotonic()
-        drone_input, dog_input = _read_agent_pair(env, setup, args)
+        drone_input, dog_input = _read_agent_pair(
+            env,
+            setup,
+            args,
+            include_rgb=include_policy_rgb,
+            include_mask=metric_mask_step,
+        )
         observation_wall_time = time.monotonic()
         snapshot_query_seconds = observation_wall_time - snapshot_start_monotonic
         if previous_observation_wall_time is None:
@@ -2102,6 +2323,49 @@ def run_episode(
         previous_observation_wall_time = observation_wall_time
         drone_input_frame, drone_input_vis, drone_input_visible, drone_input_bbox, drone_bbox_norm = drone_input
         dog_input_frame, dog_input_vis, dog_input_visible, dog_input_bbox, dog_bbox_norm = dog_input
+        if drone_input_frame is not None:
+            cached_drone_frame = drone_input_frame
+        if dog_input_frame is not None:
+            cached_dog_frame = dog_input_frame
+        if cached_drone_frame is None or cached_dog_frame is None:
+            raise RuntimeError("The first policy step must capture both follower RGB frames")
+        drone_input_frame = cached_drone_frame
+        dog_input_frame = cached_dog_frame
+        if metric_mask_step:
+            assert drone_input_vis is not None
+            assert drone_input_visible is not None
+            assert drone_input_bbox is not None
+            assert drone_bbox_norm is not None
+            assert dog_input_vis is not None
+            assert dog_input_visible is not None
+            assert dog_input_bbox is not None
+            assert dog_bbox_norm is not None
+            cached_drone_mask_metrics = (
+                float(drone_input_vis),
+                bool(drone_input_visible),
+                list(drone_input_bbox),
+                list(drone_bbox_norm),
+            )
+            cached_dog_mask_metrics = (
+                float(dog_input_vis),
+                bool(dog_input_visible),
+                list(dog_input_bbox),
+                list(dog_bbox_norm),
+            )
+        assert cached_drone_mask_metrics is not None
+        assert cached_dog_mask_metrics is not None
+        (
+            drone_input_vis,
+            drone_input_visible,
+            drone_input_bbox,
+            drone_bbox_norm,
+        ) = cached_drone_mask_metrics
+        (
+            dog_input_vis,
+            dog_input_visible,
+            dog_input_bbox,
+            dog_bbox_norm,
+        ) = cached_dog_mask_metrics
         # A deterministic episode advances exactly one dt per loop while the
         # world is paused during inference. Wall-clock inference latency must
         # not stretch the model's temporal history: training uses consecutive
@@ -2111,27 +2375,125 @@ def run_episode(
             if bool(getattr(args, "deterministic_step", True))
             else observation_wall_time
         )
+        episode_instruction = str(
+            setup.get("instruction") or args.instruction
+        )
 
         # 每一步调用模型推理
         gt_bbox_prior = args.bbox_source == "ground_truth"
-        pred = planner.predict(
-            drone_input_frame,
-            dog_input_frame,
-            drone_bbox_norm if gt_bbox_prior else None,
-            dog_bbox_norm if gt_bbox_prior else None,
-            args.instruction,
-            joint_instruction=getattr(args, "joint_instruction", None),
-            agent1_instruction=getattr(args, "agent1_instruction", None),
-            agent2_instruction=getattr(args, "agent2_instruction", None),
-            observation_time=planner_observation_time,
-            drone_roi_bbox=drone_input_bbox if planner.use_roi_tokens else None,
-            dog_roi_bbox=dog_input_bbox if planner.use_roi_tokens else None,
+        planner_pose_kwargs: dict[str, Any] = {}
+        if bool(getattr(planner, "requires_inter_agent_pose", False)):
+            # Agent poses are part of the air-ground observation contract. They
+            # contain no target pose/box and are sampled at the same observation
+            # instant as the two RGB frames.
+            planner_pose_kwargs = {
+                "drone_pose": list(env.unwrapped.obj_poses[setup["drone_id"]]),
+                "robotdog_pose": list(env.unwrapped.obj_poses[setup["robotdog_id"]]),
+            }
+        intermediate_observation_debug: dict[str, Any] = {}
+        if intermediate_observation_step:
+            intermediate_observation_debug = dict(
+                planner.observe(
+                    drone_input_frame,
+                    dog_input_frame,
+                    observation_time=planner_observation_time,
+                )
+                or {}
+            )
+        if policy_inference_step:
+            pred = planner.predict(
+                drone_input_frame,
+                dog_input_frame,
+                drone_bbox_norm if gt_bbox_prior else None,
+                dog_bbox_norm if gt_bbox_prior else None,
+                episode_instruction,
+                joint_instruction=episode_instruction,
+                agent1_instruction=episode_instruction,
+                agent2_instruction=episode_instruction,
+                observation_time=planner_observation_time,
+                drone_roi_bbox=drone_input_bbox if planner.use_roi_tokens else None,
+                dog_roi_bbox=dog_input_bbox if planner.use_roi_tokens else None,
+                drone_bbox_prompt=drone_bbox_norm if planner.use_bbox_text_prompt else None,
+                dog_bbox_prompt=dog_bbox_norm if planner.use_bbox_text_prompt else None,
+                **planner_pose_kwargs,
+            )
+        else:
+            assert cached_policy_prediction is not None
+            pred = dict(cached_policy_prediction)
+            pred["global_encoding_time"] = 0.0
+            pred["perception_time"] = 0.0
+            pred["model_time"] = 0.0
+            pred["model_time_seconds"] = 0.0
+        model_time_seconds = pred.get("model_time")
+        if model_time_seconds is None:
+            model_time_seconds = (pred.get("model_time_seconds") if isinstance(pred, dict) else None)
+        if policy_inference_step and model_time_seconds is not None:
+            model_inference_seconds_total += max(float(model_time_seconds), 0.0)
+            model_inference_steps += 1
+        if policy_inference_step:
+            drone_action, dog_action, action_debug = planner.waypoints_to_actions(
+                pred["waypoints"],
+                realtime_control_period_seconds=realtime_control_period_seconds,
+            )
+            cached_policy_prediction = dict(pred)
+            cached_policy_waypoints = np.asarray(
+                pred["waypoints"], dtype=np.float32
+            ).copy()
+            cached_drone_action = [float(value) for value in drone_action]
+            cached_dog_action = [float(value) for value in dog_action]
+            cached_action_debug = copy.deepcopy(action_debug)
+        else:
+            rollout_mode = str(
+                getattr(args, "policy_action_rollout", "future_segment")
+            )
+            if rollout_mode == "future_segment":
+                assert cached_policy_waypoints is not None
+                rollout_offset = int(step_idx % policy_inference_stride)
+                rollout_waypoints = _rollout_future_waypoint_segment(
+                    cached_policy_waypoints,
+                    rollout_offset,
+                )
+                pred["waypoints"] = rollout_waypoints
+                drone_action, dog_action, action_debug = planner.waypoints_to_actions(
+                    rollout_waypoints,
+                    realtime_control_period_seconds=realtime_control_period_seconds,
+                )
+                action_debug["policy_rollout_offset"] = rollout_offset
+            elif rollout_mode == "hold":
+                assert cached_drone_action is not None
+                assert cached_dog_action is not None
+                assert cached_action_debug is not None
+                drone_action = list(cached_drone_action)
+                dog_action = list(cached_dog_action)
+                action_debug = copy.deepcopy(cached_action_debug)
+            else:
+                raise ValueError(
+                    f"Unsupported --policy-action-rollout {rollout_mode!r}"
+                )
+        action_debug["policy_inference_stride"] = policy_inference_stride
+        action_debug["policy_interval_seconds"] = policy_inference_stride * float(args.dt)
+        action_debug["environment_step_dt_seconds"] = float(args.dt)
+        action_debug["waypoint_step_dt_seconds"] = float(
+            args.waypoint_source_dt or args.dt
         )
-        drone_action, dog_action, action_debug = planner.waypoints_to_actions(
-            pred["waypoints"],
-            realtime_control_period_seconds=realtime_control_period_seconds,
+        action_debug["history_frame_dt_seconds"] = float(
+            getattr(planner, "history_frame_dt", args.dt)
         )
+        action_debug["policy_inference_step"] = bool(policy_inference_step)
+        action_debug["policy_action_held"] = bool(not policy_inference_step)
+        action_debug["intermediate_history_observation"] = bool(
+            intermediate_observation_step
+        )
+        action_debug["intermediate_history_encoding_time"] = float(
+            intermediate_observation_debug.get("encoding_time", 0.0)
+        )
+        model_drone_action_before_override = [float(v) for v in drone_action]
         predicted_bbox = pred["refined_bbox"]
+        bbox_display_label = pred.get("bbox_display_label") or [
+            "model bbox",
+            "model bbox",
+        ]
+        bbox_source_display = pred.get("bbox_source_display", args.bbox_source)
         bbox_fallback = pred.get("bbox_fallback_to_absolute") or [False, False]
         visible_score = pred.get("visible_score") or [0.0, 0.0]
         best_candidate = pred.get("best_candidate") or [None, None]
@@ -2163,7 +2525,69 @@ def run_episode(
         dog_bbox = dog_input_bbox
         drone_bbox_norm_at_observation = drone_bbox_norm
         dog_bbox_norm_at_observation = dog_bbox_norm
+        apply_oracle_heading_assist(
+            args,
+            drone_pose_before_action,
+            dog_pose_before_action,
+            target_pose_before_action,
+            drone_action,
+            dog_action,
+            action_debug,
+        )
+        oracle_drone_action, oracle_drone_action_debug = recorded_drone_action_for_step(
+            target_trajectory,
+            args,
+            step_idx,
+        )
+        action_debug["model_drone_action_before_oracle"] = model_drone_action_before_override
+        action_debug["oracle_drone_action_debug"] = oracle_drone_action_debug
+        if oracle_drone_action is not None:
+            action_debug["model_drone_action_after_heading_assist"] = [float(v) for v in drone_action]
+            action_debug["oracle_drone_action"] = [float(v) for v in oracle_drone_action]
+            action_debug["action_source"] = (
+                f"recorded_drone_{oracle_drone_action_debug.get('source', 'unknown')}"
+            )
+            drone_action = [float(v) for v in oracle_drone_action]
+            executed_dt = max(
+                float(action_debug.get("drone_action_dt_seconds") or getattr(args, "dt", 0.1)),
+                1e-6,
+            )
+            action_debug["drone_physical_velocity_command"] = [
+                float(drone_action[0]) / executed_dt,
+                float(drone_action[1]) / executed_dt,
+                float(drone_action[2]) / executed_dt,
+            ]
+            action_debug["drone_yaw_command"] = float(drone_action[3])
+        actions[setup["drone_id"]] = drone_action
+        oracle_robotdog_action, oracle_robotdog_action_debug = recorded_robotdog_action_for_step(
+            target_trajectory,
+            args,
+            step_idx,
+        )
+        action_debug["oracle_robotdog_action_debug"] = oracle_robotdog_action_debug
+        if oracle_robotdog_action is not None:
+            action_debug["model_robotdog_action_before_oracle"] = [float(v) for v in dog_action]
+            action_debug["oracle_robotdog_action"] = [float(v) for v in oracle_robotdog_action]
+            dog_action = [float(v) for v in oracle_robotdog_action]
+            action_debug["robotdog_action_source"] = (
+                f"recorded_robotdog_{oracle_robotdog_action_debug.get('source', 'unknown')}"
+            )
+        actions[setup["robotdog_id"]] = dog_action
+        recorded_step_timing_debug = apply_recorded_step_timing(
+            env,
+            setup,
+            target_trajectory,
+            args,
+            step_idx,
+        )
+        if recorded_step_timing_debug is not None:
+            action_debug["recorded_step_timing"] = recorded_step_timing_debug
         action_send_wall_time = time.monotonic()
+        action_step_start_monotonic = time.monotonic()
+        replay_distractor_actions = replay_distractor_actions_for_step(
+            target_trajectory, step_idx
+        )
+        action_debug["replay_distractor_actions"] = replay_distractor_actions
         if bool(getattr(args, "deterministic_step", True)):
             _obs, _rewards, done, last_info, pulse_wall_seconds = deterministic_data_collection_step(
                 env,
@@ -2172,17 +2596,56 @@ def run_episode(
                 drone_action,
                 dog_action,
                 target_action=target_action,
+                distractor_actions=replay_distractor_actions,
             )
         else:
             if target_action is not None:
                 actions[setup["target_id"]] = target_action
             actions[setup["robotdog_id"]] = action_for_target_space(env, setup["robotdog_id"], dog_action)
+            for actor_id, distractor_action in zip(
+                setup.get("replay_distractor_ids", []), replay_distractor_actions
+            ):
+                actions[actor_id] = distractor_action
             pulse_t0 = time.monotonic()
             _obs, _rewards, done, last_info = data_collection_step_pose_only(env, actions)
             pulse_wall_seconds = time.monotonic() - pulse_t0
+        action_step_seconds = time.monotonic() - action_step_start_monotonic
         drone_pose_after_action = list(env.unwrapped.obj_poses[setup["drone_id"]])
         dog_pose_after_action = list(env.unwrapped.obj_poses[setup["robotdog_id"]])
         target_pose_after_action = list(env.unwrapped.obj_poses[setup["target_id"]])
+        realized_dt_seconds = (
+            float(args.dt)
+            if bool(getattr(args, "deterministic_step", True))
+            else max(float(realtime_control_period_seconds), 1e-6)
+        )
+        drone_realized_velocity = measured_body_velocity(
+            drone_pose_before_action,
+            drone_pose_after_action,
+            realized_dt_seconds,
+        )
+        dog_realized_velocity = measured_body_velocity(
+            dog_pose_before_action,
+            dog_pose_after_action,
+            realized_dt_seconds,
+        )
+        drone_commanded_velocity = [
+            float(drone_action[0]) / realized_dt_seconds,
+            float(drone_action[1]) / realized_dt_seconds,
+            float(drone_action[3]),
+        ]
+        dog_commanded_velocity = [
+            float(dog_action[1]) / UNREAL_UNITS_PER_METER,
+            0.0,
+            math.radians(float(dog_action[0])) / realized_dt_seconds,
+        ]
+        if (
+            str(getattr(args, "oracle_drone_action_source", "none")) == "none"
+            and str(getattr(args, "oracle_robotdog_action_source", "none")) == "none"
+        ):
+            planner.update_realized_velocities(
+                drone_realized_velocity,
+                dog_realized_velocity,
+            )
 
         # There is deliberately no post-action RGB+mask request here. The next
         # loop's single batch request becomes observation_{t+1}. Post-action
@@ -2191,6 +2654,17 @@ def run_episode(
         dog_dist = distance_xy_m(dog_pose, target_pose)
         drone_dist_after_action = distance_xy_m(drone_pose_after_action, target_pose_after_action)
         dog_dist_after_action = distance_xy_m(dog_pose_after_action, target_pose_after_action)
+        drone_human_collision_current = (
+            drone_dist_after_action < float(args.human_collision_distance)
+        )
+        robotdog_human_collision_current = (
+            dog_dist_after_action < float(args.human_collision_distance)
+        )
+        drone_human_collision = drone_human_collision or drone_human_collision_current
+        robotdog_human_collision = robotdog_human_collision or robotdog_human_collision_current
+        human_collision = human_collision or (
+            drone_human_collision_current or robotdog_human_collision_current
+        )
         drone_collision = drone_collision_from_info(
             last_info,
             setup["drone_id"],
@@ -2207,22 +2681,32 @@ def run_episode(
             dog_pose_after_action,
             target_pose_after_action,
         )
-        collision = collision or drone_collision or dog_collision
+        physical_collision = physical_collision or drone_collision or dog_collision
+        # The evaluation contract treats either a UE physical contact or an
+        # after-action human distance strictly below the configured threshold
+        # as a collision.  This primary flag controls early stopping, SR and
+        # aggregate CR; the individual fields remain available for analysis.
+        collision = physical_collision or human_collision
 
+        drone_follow_distance = drone_dist_after_action
+        dog_follow_distance = dog_dist_after_action
         drone_following = bool(
             drone_visible
-            and args.drone_min_follow_dist <= drone_dist <= args.drone_max_follow_dist
+            and args.drone_min_follow_dist <= drone_follow_distance <= args.drone_max_follow_dist
         )
         dog_following = bool(
             dog_visible
-            and args.robotdog_min_follow_dist <= dog_dist <= args.robotdog_max_follow_dist
+            and args.robotdog_min_follow_dist <= dog_follow_distance <= args.robotdog_max_follow_dist
         )
         joint_following = bool(drone_following and dog_following)
         if joint_following:
             lost_count = 0
             failure_count = 0
         else:
-            too_far = drone_dist > args.drone_lost_distance or dog_dist > args.robotdog_lost_distance
+            too_far = (
+                drone_follow_distance > args.drone_lost_distance
+                or dog_follow_distance > args.robotdog_lost_distance
+            )
             # Legacy OpenTrackVLA declares Lost only after consecutive
             # out-of-range frames. Temporary invisibility lowers TR but does
             # not itself advance the Lost counter.
@@ -2230,59 +2714,95 @@ def run_episode(
             if step_idx + 1 > args.failure_warmup_steps:
                 failure_count += 1
 
-        global_frame = get_global_frame(env, args, target_pose, dog_pose, drone_pose)
+        global_frame = None
+        if args.save_video and args.write_global_video:
+            global_frame = get_global_frame(
+                env, args, target_pose, dog_pose, drone_pose
+            )
         loop_end_monotonic = time.monotonic()
         loop_wall_time_seconds = loop_end_monotonic - loop_start_monotonic
         drone_vis_frame = drone_input_frame
         dog_vis_frame = dog_input_frame
-        if args.trajectory_overlay:
+        if args.save_video and args.trajectory_overlay:
             drone_vis_frame = _render_bgr_frame_with_traj(
                 drone_vis_frame, pred["waypoints"][0], scale=args.trajectory_scale
             )
             dog_vis_frame = _render_bgr_frame_with_traj(
                 dog_vis_frame, pred["waypoints"][1], scale=args.trajectory_scale
             )
-        if planner.use_roi_tokens and pred.get("roi_crop_xyxy") is not None:
+        if (
+            args.save_video
+            and planner.use_roi_tokens
+            and pred.get("roi_crop_xyxy") is not None
+        ):
             drone_vis_frame = _draw_roi_crop_xyxy(drone_vis_frame, pred["roi_crop_xyxy"][0], "oracle ROI crop")
             dog_vis_frame = _draw_roi_crop_xyxy(dog_vis_frame, pred["roi_crop_xyxy"][1], "oracle ROI crop")
-        drone_vis_frame = _overlay_text(
-            _draw_predicted_bbox(drone_vis_frame, predicted_bbox[0], "model bbox"),
-            [
-                f"ep={episode_id} step={step_idx + 1}",
-                f"drone d={drone_dist:.2f} bbox_iou={drone_bbox_iou:.2f}",
-                f"bbox_source={args.bbox_source} vis={float(visible_score[0]):.2f} abs_fallback={int(bbox_fallback[0])}",
-                (
-                    f"roi={pred.get('roi_bbox_source')} valid={int(bool((pred.get('roi_valid') or [False, False])[0]))}"
-                    if planner.use_roi_tokens
-                    else "roi=off"
+        if args.save_video:
+            drone_vis_frame = _overlay_text(
+                _draw_predicted_bbox(
+                    drone_vis_frame,
+                    predicted_bbox[0],
+                    str(bbox_display_label[0]),
                 ),
-                _candidate_label(best_candidate[0], best_candidate_score[0]),
-                "cmd_v="
-                f"[{action_debug['drone_physical_velocity_command'][0]:.2f},"
-                f"{action_debug['drone_physical_velocity_command'][1]:.2f}]m/s "
-                f"yaw={drone_action[3]:.2f}rad/s",
-            ],
-        )
-        dog_vis_frame = _overlay_text(
-            _draw_predicted_bbox(dog_vis_frame, predicted_bbox[1], "model bbox"),
-            [
-                f"ep={episode_id} step={step_idx + 1}",
-                f"dog d={dog_dist:.2f} bbox_iou={dog_bbox_iou:.2f}",
-                f"bbox_source={args.bbox_source} vis={float(visible_score[1]):.2f} abs_fallback={int(bbox_fallback[1])}",
-                (
-                    f"roi={pred.get('roi_bbox_source')} valid={int(bool((pred.get('roi_valid') or [False, False])[1]))}"
-                    if planner.use_roi_tokens
-                    else "roi=off"
+                [
+                    f"ep={episode_id} step={step_idx + 1}",
+                    f"trajectory={_trajectory_source_label(action_debug, 0)}",
+                    f"drone d={drone_dist:.2f} bbox_iou={drone_bbox_iou:.2f}",
+                    f"bbox_source={bbox_source_display} vis={float(visible_score[0]):.2f} abs_fallback={int(bbox_fallback[0])}",
+                    (
+                        f"roi={pred.get('roi_bbox_source')} valid={int(bool((pred.get('roi_valid') or [False, False])[0]))}"
+                        if planner.use_roi_tokens
+                        else "roi=off"
+                    ),
+                    _candidate_label(best_candidate[0], best_candidate_score[0]),
+                    "cmd_v="
+                    f"[{action_debug['drone_physical_velocity_command'][0]:.2f},"
+                    f"{action_debug['drone_physical_velocity_command'][1]:.2f}]m/s "
+                    f"yaw={drone_action[3]:.2f}rad/s",
+                    "ctrl="
+                    f"{action_debug.get('waypoint_control_mode', args.waypoint_control_mode)} "
+                    f"env=[{drone_action[0]:.3f},{drone_action[1]:.3f},"
+                    f"{drone_action[2]:.3f},{drone_action[3]:.3f}]",
+                ],
+            )
+            dog_vis_frame = _overlay_text(
+                _draw_predicted_bbox(
+                    dog_vis_frame,
+                    predicted_bbox[1],
+                    str(bbox_display_label[1]),
                 ),
-                _candidate_label(best_candidate[1], best_candidate_score[1]),
-                f"cmd_v={dog_action[1] / UNREAL_UNITS_PER_METER:.2f}m/s "
-                f"turn={dog_action[0]:.1f}deg",
-            ],
-        )
-        frames_drone.append(drone_vis_frame)
-        frames_dog.append(dog_vis_frame)
-        if args.write_global_video and global_frame is not None:
-            frames_global.append(global_frame)
+                [
+                    f"ep={episode_id} step={step_idx + 1}",
+                    f"trajectory={_trajectory_source_label(action_debug, 1)}",
+                    f"dog d={dog_dist:.2f} bbox_iou={dog_bbox_iou:.2f}",
+                    f"bbox_source={bbox_source_display} vis={float(visible_score[1]):.2f} abs_fallback={int(bbox_fallback[1])}",
+                    (
+                        f"roi={pred.get('roi_bbox_source')} valid={int(bool((pred.get('roi_valid') or [False, False])[1]))}"
+                        if planner.use_roi_tokens
+                        else "roi=off"
+                    ),
+                    _candidate_label(best_candidate[1], best_candidate_score[1]),
+                    f"cmd_v={dog_action[1] / UNREAL_UNITS_PER_METER:.2f}m/s "
+                    f"turn={dog_action[0]:.1f}deg",
+                    "ctrl="
+                    f"{action_debug.get('waypoint_control_mode', args.waypoint_control_mode)} "
+                    f"env=[turn={dog_action[0]:.1f}deg,speed="
+                    f"{dog_action[1] / UNREAL_UNITS_PER_METER:.2f}m/s]",
+                ],
+            )
+            frames_drone.append(drone_vis_frame)
+            frames_dog.append(dog_vis_frame)
+            if args.write_global_video and global_frame is not None:
+                frames_global.append(
+                    _overlay_text(
+                        global_frame,
+                        [
+                            f"ep={episode_id} step={step_idx + 1}",
+                            f"drone trajectory={_trajectory_source_label(action_debug, 0)}",
+                            f"robotdog trajectory={_trajectory_source_label(action_debug, 1)}",
+                        ],
+                    )
+                )
 
         roi_valid_values = pred.get("roi_valid") or [None, None]
         roi_crop_values = pred.get("roi_crop_xyxy") or [None, None]
@@ -2303,7 +2823,9 @@ def run_episode(
                 "roi_crop_xyxy": roi_crop_values[0],
                 "roi_expand_ratio": pred.get("roi_expand_ratio"),
                 "roi_token_count": pred.get("roi_token_count"),
+                "bbox_prompt_text": pred.get("bbox_prompt_text"),
                 "global_encoding_time_s": pred.get("global_encoding_time"),
+                "model_time_s": None if model_time_seconds is None else float(model_time_seconds),
                 "roi_encoding_time_s": pred.get("roi_encoding_time"),
                 "predicted_bbox": predicted_bbox[0],
                 "raw_refined_bbox": pred.get("raw_refined_bbox", [None, None])[0],
@@ -2314,18 +2836,32 @@ def run_episode(
                 "input_target_visible": bool(drone_input_visible),
                 "input_target_visibility": float(drone_input_vis),
                 "predicted_waypoints": pred["waypoints"][0].tolist(),
+                "waypoint_control_mode": action_debug.get("waypoint_control_mode", args.waypoint_control_mode),
+                "inverse_control": action_debug.get("drone_inverse"),
                 "best_candidate": best_candidate[0],
                 "best_candidate_score": best_candidate_score[0],
                 "target_center_error": bbox_center_error(drone_bbox, args),
                 "target_centered": bool(drone_visible and bbox_centered(drone_bbox, args)),
-                "base_velocity": action_debug["drone_velocity_pred"],
+                "base_velocity": drone_realized_velocity,
+                "desired_base_velocity": action_debug["drone_velocity_pred"],
+                "commanded_base_velocity": drone_commanded_velocity,
+                "base_velocity_dt_s": float(realized_dt_seconds),
+                "model_drone_action": action_debug.get("model_drone_action_before_oracle"),
+                "oracle_drone_action": action_debug.get("oracle_drone_action"),
+                "oracle_drone_action_debug": action_debug.get("oracle_drone_action_debug"),
                 "drone_action": [float(v) for v in drone_action],
                 "env_action": [float(v) for v in drone_action],
                 "env_action_space": "drone set_move_bp raw [x_step_like, y_step_like, z_step_like, yaw_rate]",
-                "command_label_source": "model_waypoint_to_env_action",
+                "command_label_source": action_debug.get("action_source", "model_waypoint_to_env_action"),
                 "obs_action_alignment": "obs_t_action_t",
                 "snap_heading": bool(args.snap_heading),
-                "yaw_control_mode": "oracle_snap" if args.snap_heading else "action",
+                "yaw_control_mode": (
+                    "recorded_oracle_action"
+                    if action_debug.get("oracle_drone_action") is not None
+                    else "oracle_snap"
+                    if args.snap_heading
+                    else "action"
+                ),
                 "snapshot_query_time_s": float(snapshot_query_seconds),
                 "observation_timestamp_s": float(observation_wall_time),
                 "action_compute_timestamp_s": float(action_compute_wall_time),
@@ -2342,8 +2878,14 @@ def run_episode(
                     distance_xy_m(drone_pose_before_action, drone_pose_after_action)
                 ),
                 "action_pulse_wall_seconds": float(pulse_wall_seconds),
+                "action_step_time_s": float(action_step_seconds),
                 "following": bool(drone_following),
+                "following_distance_m": float(drone_follow_distance),
+                "following_distance_source": "after_action",
                 "collision": bool(drone_collision),
+                "human_collision": bool(drone_human_collision),
+                "human_collision_current": bool(drone_human_collision_current),
+                "human_collision_distance_m": float(args.human_collision_distance),
                 "drone_pose": drone_pose,
                 "drone_pose_after_action": drone_pose_after_action,
                 "target_pose": target_pose,
@@ -2369,6 +2911,8 @@ def run_episode(
                 "roi_expand_ratio": pred.get("roi_expand_ratio"),
                 "roi_token_count": pred.get("roi_token_count"),
                 "global_encoding_time_s": pred.get("global_encoding_time"),
+                "perception_time_s": pred.get("perception_time"),
+                "model_time_s": None if model_time_seconds is None else float(model_time_seconds),
                 "roi_encoding_time_s": pred.get("roi_encoding_time"),
                 "predicted_bbox": predicted_bbox[1],
                 "raw_refined_bbox": pred.get("raw_refined_bbox", [None, None])[1],
@@ -2379,15 +2923,23 @@ def run_episode(
                 "input_target_visible": bool(dog_input_visible),
                 "input_target_visibility": float(dog_input_vis),
                 "predicted_waypoints": pred["waypoints"][1].tolist(),
+                "waypoint_control_mode": action_debug.get("waypoint_control_mode", args.waypoint_control_mode),
+                "inverse_control": action_debug.get("robotdog_inverse"),
                 "best_candidate": best_candidate[1],
                 "best_candidate_score": best_candidate_score[1],
                 "target_center_error": bbox_center_error(dog_bbox, args),
                 "target_centered": bool(dog_visible and bbox_centered(dog_bbox, args)),
-                "base_velocity": action_debug["robotdog_velocity_pred"],
+                "base_velocity": dog_realized_velocity,
+                "desired_base_velocity": action_debug["robotdog_velocity_pred"],
+                "commanded_base_velocity": dog_commanded_velocity,
+                "base_velocity_dt_s": float(realized_dt_seconds),
+                "model_robotdog_action": action_debug.get("model_robotdog_action_before_oracle"),
+                "oracle_robotdog_action": action_debug.get("oracle_robotdog_action"),
+                "oracle_robotdog_action_debug": action_debug.get("oracle_robotdog_action_debug"),
                 "ground_action": [float(v) for v in dog_action],
                 "env_action": [float(v) for v in dog_action],
                 "env_action_space": "robotdog set_move_bp [turn_deg, speed_cm_s]",
-                "command_label_source": "model_waypoint_to_env_action",
+                "command_label_source": action_debug.get("robotdog_action_source", "model_waypoint_to_env_action"),
                 "obs_action_alignment": "obs_t_action_t",
                 "snap_heading": bool(args.snap_heading),
                 "yaw_control_mode": "oracle_snap" if args.snap_heading else "action",
@@ -2408,7 +2960,12 @@ def run_episode(
                 ),
                 "action_pulse_wall_seconds": float(pulse_wall_seconds),
                 "following": bool(dog_following),
+                "following_distance_m": float(dog_follow_distance),
+                "following_distance_source": "after_action",
                 "collision": bool(dog_collision),
+                "human_collision": bool(robotdog_human_collision),
+                "human_collision_current": bool(robotdog_human_collision_current),
+                "human_collision_distance_m": float(args.human_collision_distance),
                 "robotdog_lateral_ignored": action_debug["robotdog_lateral_ignored"],
                 "robotdog_pose": dog_pose,
                 "robotdog_pose_after_action": dog_pose_after_action,
@@ -2423,7 +2980,18 @@ def run_episode(
                 "joint_following": joint_following,
                 "drone_following": bool(drone_following),
                 "robotdog_following": bool(dog_following),
-                "collision": bool(drone_collision or dog_collision),
+                "drone_following_distance": float(drone_follow_distance),
+                "robotdog_following_distance": float(dog_follow_distance),
+                "following_distance_source": "after_action",
+                "collision": bool(collision),
+                "physical_collision": bool(drone_collision or dog_collision),
+                "human_collision": bool(human_collision),
+                "human_collision_current": bool(
+                    drone_human_collision_current or robotdog_human_collision_current
+                ),
+                "drone_human_collision": bool(drone_human_collision),
+                "robotdog_human_collision": bool(robotdog_human_collision),
+                "human_collision_distance_m": float(args.human_collision_distance),
                 "lost_count": int(lost_count),
                 "failure_count": int(failure_count),
                 "visible_score": pred.get("visible_score"),
@@ -2439,10 +3007,17 @@ def run_episode(
                 "roi_expand_ratio": pred.get("roi_expand_ratio"),
                 "roi_token_count": pred.get("roi_token_count"),
                 "global_encoding_time_s": pred.get("global_encoding_time"),
+                "perception_time_s": pred.get("perception_time"),
+                "model_time_s": None if model_time_seconds is None else float(model_time_seconds),
                 "roi_encoding_time_s": pred.get("roi_encoding_time"),
                 "bbox_fallback_to_absolute": bbox_fallback,
                 "target_action": _jsonable_action(target_action),
                 "target_action_debug": setup.get("target_path_action_debug"),
+                "oracle_drone_action": action_debug.get("oracle_drone_action"),
+                "oracle_drone_action_debug": action_debug.get("oracle_drone_action_debug"),
+                "oracle_robotdog_action": action_debug.get("oracle_robotdog_action"),
+                "oracle_robotdog_action_debug": action_debug.get("oracle_robotdog_action_debug"),
+                "recorded_step_timing": action_debug.get("recorded_step_timing"),
                 "drone_bbox_iou": float(drone_bbox_iou),
                 "robotdog_bbox_iou": float(dog_bbox_iou),
                 "drone_visible_correct": bool((float(visible_score[0]) >= 0.5) == bool(drone_input_visible)),
@@ -2454,6 +3029,7 @@ def run_episode(
                 "action_pulse_wall_seconds": float(pulse_wall_seconds),
                 "observation_to_action_seconds": float(observation_to_action_seconds),
                 "snapshot_query_time_s": float(snapshot_query_seconds),
+                "action_step_time_s": float(action_step_seconds),
                 "observation_timestamp_s": float(observation_wall_time),
                 "action_compute_timestamp_s": float(action_compute_wall_time),
                 "action_send_timestamp_s": float(action_send_wall_time),
@@ -2470,6 +3046,7 @@ def run_episode(
                 "snap_heading": bool(args.snap_heading),
                 "yaw_control_mode": "oracle_snap" if args.snap_heading else "action",
                 "observation_snapshot_count": 1,
+                "metric_mask_sampled": bool(metric_mask_step),
                 "post_action_rgb_mask_capture": False,
                 "target_motion_mode": setup["target_motion_mode"],
                 "recorded_target_frame": step_idx + 1 if target_trajectory is not None else None,
@@ -2611,14 +3188,24 @@ def run_episode(
         for item in combined_infos
     )
     visible_accuracy = visible_correct / max(total_step * 2, 1)
+    def _timing_sum(key: str) -> float:
+        return sum(float(item.get(key) or 0.0) for item in combined_infos)
 
     # Match the legacy OpenTrackVLA terminal-success semantics. Per-step TR
     # remains upper-bound-only, while an episode that ends early must finish
     # inside both agents' configured follow-distance bands. A full-horizon
     # episode falls back to the final per-step joint-following result.
     completed_full_horizon = bool(total_step >= episode_max_steps)
-    final_drone_distance = float(drone_infos[-1]["dis_to_human"]) if drone_infos else float("inf")
-    final_dog_distance = float(dog_infos[-1]["dis_to_human"]) if dog_infos else float("inf")
+    final_drone_distance = (
+        float(drone_infos[-1].get("dis_to_human_after_action", drone_infos[-1]["dis_to_human"]))
+        if drone_infos
+        else float("inf")
+    )
+    final_dog_distance = (
+        float(dog_infos[-1].get("dis_to_human_after_action", dog_infos[-1]["dis_to_human"]))
+        if dog_infos
+        else float("inf")
+    )
     final_drone_following = bool(drone_infos[-1]["following"]) if drone_infos else False
     final_dog_following = bool(dog_infos[-1]["following"]) if dog_infos else False
     final_joint_following = bool(final_drone_following and final_dog_following)
@@ -2661,6 +3248,11 @@ def run_episode(
         "success": 1.0 if success else 0.0,
         "total_step": total_step,
         "collision": 1.0 if collision else 0.0,
+        "physical_collision": 1.0 if physical_collision else 0.0,
+        "human_collision": 1.0 if human_collision else 0.0,
+        "drone_human_collision": 1.0 if drone_human_collision else 0.0,
+        "robotdog_human_collision": 1.0 if robotdog_human_collision else 0.0,
+        "human_collision_distance_m": float(args.human_collision_distance),
         "joint_following_rate": float(joint_rate),
         "drone_following_rate": float(drone_rate),
         "robotdog_following_rate": float(dog_rate),
@@ -2692,17 +3284,48 @@ def run_episode(
         "roi_expand_ratio": float(planner.roi_expand_ratio) if planner.use_roi_tokens else None,
         "roi_token_count": int(planner.roi_token_count) if planner.use_roi_tokens else None,
         "roi_make_square": bool(planner.roi_make_square) if planner.use_roi_tokens else None,
+        "use_visual_section_markers": bool(planner.use_visual_section_markers),
+        "visual_section_marker_version": (
+            "global_history_current_target_roi_markers_v1"
+            if planner.use_visual_section_markers
+            else None
+        ),
+        "roi_prompt_version": "roi_visual_layout_prompt_v1" if planner.use_roi_tokens else None,
         "bbox_usage_note": (
             "roi_bbox is ground-truth and used only for image cropping; bbox_feat=None."
             if planner.use_roi_tokens
             else None
         ),
         "ckpt_bbox_dropout_prob": float(planner.ckpt_bbox_dropout_prob),
-        "instruction": args.instruction,
-        "joint_instruction": getattr(args, "joint_instruction", None) or args.instruction,
-        "agent1_instruction": getattr(args, "agent1_instruction", None),
-        "agent2_instruction": getattr(args, "agent2_instruction", None),
+        "instruction": setup.get("instruction") or args.instruction,
+        "joint_instruction": setup.get("instruction") or getattr(args, "joint_instruction", None) or args.instruction,
+        "agent1_instruction": setup.get("instruction") or getattr(args, "agent1_instruction", None),
+        "agent2_instruction": setup.get("instruction") or getattr(args, "agent2_instruction", None),
+        "replay_distractors": bool(setup.get("replay_distractors", False)),
+        "replay_distractor_count": int(setup.get("replay_distractor_count", 0)),
+        "metric_target_actor_id": int(setup["target_id"]),
+        "metric_target_source": "env.obj_poses[target_id]",
+        # Legacy end-to-end episode throughput retained for compatibility.
         "fps": total_step / elapsed,
+        # Requested model-only speed. This is the reciprocal of the mean pure
+        # forward latency and excludes all non-model work.
+        "model_inference_seconds_total": float(model_inference_seconds_total),
+        "model_inference_steps": int(model_inference_steps),
+        "model_latency_ms": (
+            float(model_inference_seconds_total / model_inference_steps * 1000.0)
+            if model_inference_steps else 0.0
+        ),
+        "model_fps": (
+            float(model_inference_steps / model_inference_seconds_total)
+            if model_inference_seconds_total > 0.0 else 0.0
+        ),
+        "snapshot_seconds_total": _timing_sum("snapshot_query_time_s"),
+        "planner_seconds_total": _timing_sum("observation_to_action_seconds"),
+        "vision_encoding_seconds_total": _timing_sum("global_encoding_time_s"),
+        "perception_seconds_total": _timing_sum("perception_time_s"),
+        "action_pulse_seconds_total": _timing_sum("action_pulse_wall_seconds"),
+        "action_step_seconds_total": _timing_sum("action_step_time_s"),
+        "loop_seconds_total": _timing_sum("loop_wall_time_s"),
         "ckpt": str(planner.ckpt_path),
         "env_id": args.env_id,
         "model_type": "multi_agent",
@@ -2711,17 +3334,59 @@ def run_episode(
         "target_stop_step": setup.get("target_stop_step"),
         "target_stop_wait_count": int(setup.get("target_stop_wait_count", 0)),
         "target_stop_wait_steps": int(setup["target_stop_wait_steps"]),
+        "oracle_drone_action_source": str(getattr(args, "oracle_drone_action_source", "none")),
+        "oracle_drone_action_hold_last": bool(getattr(args, "oracle_drone_action_hold_last", True)),
+        "oracle_robotdog_action_source": str(getattr(args, "oracle_robotdog_action_source", "none")),
+        "oracle_robotdog_action_hold_last": bool(getattr(args, "oracle_robotdog_action_hold_last", True)),
+        "oracle_recorded_step_timing": bool(getattr(args, "oracle_recorded_step_timing", False)),
         "target_goal_reach_distance": float(args.target_goal_reach_distance),
         "action_pulse_control": bool(getattr(args, "deterministic_step", True)),
         "obs_action_alignment": "obs_t_action_t",
         "snap_heading": bool(args.snap_heading),
         "yaw_control_mode": "oracle_snap" if args.snap_heading else "action",
-        "observation_snapshot_policy": "one_pre_action_rgb_mask_batch_per_step",
+        "observation_snapshot_policy": (
+            "sampled_rgb_and_mask_with_pose_only_intermediate_steps"
+            if int(getattr(args, "metric_mask_stride", 1) or 1) > 1
+            else "rgb_mask_on_policy_steps_mask_only_between_policy_steps"
+            if int(getattr(args, "policy_inference_stride", 1) or 1) > 1
+            and bool(getattr(args, "skip_rgb_between_policy_steps", True))
+            else "one_pre_action_rgb_mask_batch_per_step"
+        ),
+        "policy_inference_stride": int(
+            getattr(args, "policy_inference_stride", 1) or 1
+        ),
+        "policy_interval_seconds": int(
+            getattr(args, "policy_inference_stride", 1) or 1
+        ) * float(args.dt),
+        "environment_step_dt_seconds": float(args.dt),
+        "waypoint_step_dt_seconds": float(args.waypoint_source_dt or args.dt),
+        "policy_action_rollout": str(
+            getattr(args, "policy_action_rollout", "future_segment")
+        ),
+        "skip_rgb_between_policy_steps": bool(
+            getattr(args, "skip_rgb_between_policy_steps", True)
+        ),
+        "mask_image_format": str(getattr(args, "mask_image_format", "png")),
+        "metric_mask_stride": int(getattr(args, "metric_mask_stride", 1) or 1),
+        "metric_mask_sampling": (
+            "exact_every_step"
+            if int(getattr(args, "metric_mask_stride", 1) or 1) == 1
+            else "periodic_zero_order_hold_with_exact_target_stopped_steps"
+        ),
+        "reuse_post_action_poses": bool(
+            getattr(args, "reuse_post_action_poses", False)
+        ),
         "post_action_rgb_mask_capture": False,
         "deterministic_step": bool(getattr(args, "deterministic_step", True)),
+        "deterministic_pause_check_stride": int(
+            getattr(args, "deterministic_pause_check_stride", 1) or 0
+        ),
         "fixed_timestep_seconds": (
             float(args.dt) if bool(getattr(args, "deterministic_step", True)) else None
         ),
+        "ue_interval_ms": int(getattr(args, "ue_interval_ms", None) or round(float(args.dt) * 1000.0)),
+        "bp_interval_s": float(getattr(args, "ue_interval_ms", None) or round(float(args.dt) * 1000.0)) / 1000.0,
+        "velocity_feedback_config": setup.get("velocity_feedback"),
         "realtime_waypoint_timing": bool(
             getattr(args, "realtime_waypoint_timing", False)
         ),
@@ -2741,6 +3406,7 @@ def run_episode(
         "success_rule": {
             "full_horizon": "final_joint_following",
             "early_end": "final_joint_following_and_both_agents_in_follow_range",
+            "following_distance_source": "after_action",
             "drone_final_range": [
                 float(args.drone_min_follow_dist),
                 float(args.drone_max_follow_dist),
@@ -2799,13 +3465,13 @@ def reset_planner_debug_file(args: argparse.Namespace) -> None:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Evaluate MultiAgentOpenTrackVLA in UnrealZoo.")
     parser.add_argument("--ckpt", required=True, help="Multi-agent checkpoint file or directory containing model_epoch*.pt.")
-    parser.add_argument("--save-path", default="/data/hdt/ntv_data/sim_data/eval/unrealzoo_multi_agent")
+    parser.add_argument("--save-path", default="/data/yh/newtrackvla修改/newtrackvla_base_yh_clean/output/eval_unrealzoo_multi_agent")
     parser.add_argument("--env-id", default=DEFAULT_ENV_ID)
     parser.add_argument("--episodes", type=int, default=2)
     parser.add_argument(
         "--recorded-target-dir",
         default=None,
-        help="Replay only target_pose from *_drone_info.json while agents and observations remain online closed-loop.",
+        help="Replay the recorded human trajectory from *_drone_info.json with action pulses while agents remain closed-loop.",
     )
     parser.add_argument(
         "--recorded-target-episodes",
@@ -2837,8 +3503,15 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Optional agent2/robotdog-specific instruction.",
     )
+    parser.add_argument(
+        "--use-bbox-text-prompt",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Append per-step bbox spatial text prompt; default follows checkpoint config.",
+    )
     parser.add_argument("--device", default=None)
     parser.add_argument("--llm-name", default="Qwen/Qwen3-0.6B")
+    parser.add_argument("--text-max-length", type=int, default=192)
     parser.add_argument("--vision-feat-dim", type=int, default=1536)
     parser.add_argument("--n-waypoints", type=int, default=8)
     parser.add_argument("--history", type=int, default=31)
@@ -2850,6 +3523,34 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--image-size", type=int, default=384)
     parser.add_argument("--vision-resize-mode", choices=("letterbox", "stretch"), default="letterbox")
+    parser.add_argument(
+        "--vision-amp",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Run DINO/SigLIP image encoders under CUDA bfloat16 autocast when available.",
+    )
+    parser.add_argument(
+        "--inference-amp",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Run the V3 model forward under CUDA bfloat16 autocast when available.",
+    )
+    parser.add_argument(
+        "--perception-config",
+        type=Path,
+        default=None,
+        help="YOLO perception YAML used by air-ground cooperative inference.",
+    )
+    parser.add_argument("--yolo-weights", type=Path, default=None)
+    parser.add_argument("--yolo-image-size", type=int, default=None)
+    parser.add_argument("--person-confidence", type=float, default=None)
+    parser.add_argument("--object-confidence", type=float, default=None)
+    parser.add_argument(
+        "--yolo-half",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Use FP16 for online YOLO inference; defaults to the perception YAML.",
+    )
     parser.add_argument("--alpha-xy", type=float, default=1.0)
     parser.add_argument("--use-angle-tvi", action="store_true")
     parser.add_argument("--no-tanh-actions", action=argparse.BooleanOptionalAction, default=True)
@@ -2892,16 +3593,42 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--roi-expand-ratio", type=float, default=1.5)
     parser.add_argument("--roi-token-count", type=int, default=16)
     parser.add_argument("--roi-make-square", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument(
+        "--roi-override-checkpoint-config",
+        action="store_true",
+        help="Use command-line ROI crop settings instead of ROI settings saved in the checkpoint config.",
+    )
+    parser.add_argument(
+        "--use-visual-section-markers",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Insert learned GLOBAL_HISTORY/GLOBAL_CURRENT/TARGET_ROI section marker tokens. Usually read from ROI checkpoint config.",
+    )
 
     parser.add_argument("--width", type=int, default=640)
     parser.add_argument("--height", type=int, default=480)
     parser.add_argument("--fps", type=int, default=10)
     parser.add_argument("--dt", type=float, default=0.1)
     parser.add_argument(
+        "--ue-interval-ms",
+        type=int,
+        default=None,
+        help="BP movement interval. Deterministic evaluation requires round(dt*1000).",
+    )
+    parser.add_argument(
         "--deterministic-step",
         action=argparse.BooleanOptionalAction,
         default=True,
         help="Fixed-step evaluation mode. Default aligns eval with step-based training labels.",
+    )
+    parser.add_argument(
+        "--deterministic-pause-check-stride",
+        type=int,
+        default=1,
+        help=(
+            "Verify UE paused state every N physics steps in deterministic "
+            "mode; 1 is the canonical defensive check and 0 disables polling."
+        ),
     )
     parser.add_argument(
         "--realtime-waypoint-timing",
@@ -2932,6 +3659,74 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--save-video", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--write-global-video", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--trajectory-overlay", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument(
+        "--fast-eval-io",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Skip unused post-action rendering and capture only the two "
+            "follower RGB/mask views. This preserves closed-loop actions and "
+            "metrics; intended for the isolated V3 fast evaluator."
+        ),
+    )
+    parser.add_argument(
+        "--mask-image-format",
+        choices=("png", "bmp"),
+        default="png",
+        help=(
+            "Wire format for exact per-step UnrealCV object masks. BMP avoids "
+            "PNG compression/decompression CPU cost at the expense of larger "
+            "local-socket payloads; png preserves the canonical default."
+        ),
+    )
+    parser.add_argument(
+        "--metric-mask-stride",
+        type=int,
+        default=1,
+        help=(
+            "Capture exact GT object masks every N physics steps and use the "
+            "latest sample between captures. Target-stopped terminal steps "
+            "always capture exact masks. 1 preserves exact per-step metrics."
+        ),
+    )
+    parser.add_argument(
+        "--reuse-post-action-poses",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "In deterministic paused-world evaluation, reuse the exact poses "
+            "already refreshed after the prior action instead of querying the "
+            "same object poses again with the next image snapshot."
+        ),
+    )
+    parser.add_argument(
+        "--policy-inference-stride",
+        type=int,
+        default=1,
+        help=(
+            "Run the visual policy every N deterministic physics steps and hold "
+            "the most recent action between policy steps. Physics and GT-mask "
+            "metrics remain evaluated every step; 1 preserves the canonical protocol."
+        ),
+    )
+    parser.add_argument(
+        "--skip-rgb-between-policy-steps",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "When policy-inference-stride > 1, request pose+object-mask without "
+            "unused RGB on held-action steps."
+        ),
+    )
+    parser.add_argument(
+        "--policy-action-rollout",
+        choices=("future_segment", "hold"),
+        default="future_segment",
+        help=(
+            "Between policy inferences, either execute successive cached future "
+            "trajectory segments or repeat the first action."
+        ),
+    )
     parser.add_argument("--trajectory-scale", type=float, default=120.0, help="Trajectory overlay pixels per meter.")
     parser.add_argument("--top-view-height", type=float, default=None)
     parser.add_argument("--debug-motion", action="store_true")
@@ -2948,7 +3743,24 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--brightness-offset", type=float, default=0.0)
     parser.add_argument("--brightness-config", type=Path, default=None)
 
-    parser.add_argument("--human-speed", type=float, default=0.9, choices=HUMAN_SPEED_CHOICES_MPS, help="Target human speed, meters/s.")
+    parser.add_argument(
+        "--human-speed",
+        type=float,
+        default=0.5,
+        help="Target human speed in m/s; arbitrary positive values are accepted.",
+    )
+    parser.add_argument(
+        "--environment-ground-max-speed-mps",
+        type=float,
+        default=100.0,
+        help="UE BP max-speed ceiling for human and robotdog; 100 matches the verified fixed-step replay without clipping actions.",
+    )
+    parser.add_argument(
+        "--ground-acceleration",
+        type=float,
+        default=10000.0,
+        help="UE BP human/robotdog acceleration; 10000 matches the verified fixed-step replay response.",
+    )
     parser.add_argument("--human-turn", type=float, default=5.0)
     parser.add_argument("--human-reverse-scale", type=float, default=0.5)
     parser.add_argument("--human-goal-min-distance", type=float, default=700.0)
@@ -2978,7 +3790,7 @@ def parse_args() -> argparse.Namespace:
 
     parser.add_argument("--robotdog-ideal-follow-dist", type=float, default=6.25)
     # 狗的最大最小跟踪距离
-    parser.add_argument("--robotdog-min-follow-dist", type=float, default=4.5)
+    parser.add_argument("--robotdog-min-follow-dist", type=float, default=1.0)
     parser.add_argument("--robotdog-max-follow-dist", type=float, default=8.0)
     parser.add_argument("--robotdog-max-speed", type=float, default=None, help="Robot dog speed limit, meters/s. Defaults from --human-speed.")
     parser.add_argument("--robotdog-max-lateral-speed", type=float, default=0.45)
@@ -3000,8 +3812,14 @@ def parse_args() -> argparse.Namespace:
 
     parser.add_argument("--drone-ideal-follow-dist", type=float, default=4.25)
     # 无人机的最大最小跟踪距离
-    parser.add_argument("--drone-min-follow-dist", type=float, default=3.0)
-    parser.add_argument("--drone-max-follow-dist", type=float, default=5.5)
+    parser.add_argument("--drone-min-follow-dist", type=float, default=1.0)
+    parser.add_argument("--drone-max-follow-dist", type=float, default=6.5)
+    parser.add_argument(
+        "--human-collision-distance",
+        type=float,
+        default=0.5,
+        help="Habitat-style persistent human proximity collision threshold in meters.",
+    )
     parser.add_argument("--drone-height", type=float, default=400.0)
     parser.add_argument("--drone-max-speed", type=float, default=None, help="Drone physical speed limit, meters/s. Defaults from --human-speed.")
     parser.add_argument("--drone-max-vx", type=float, default=None, help="Legacy drone vx clip in m/s. Defaults from --drone-max-speed.")
@@ -3010,7 +3828,10 @@ def parse_args() -> argparse.Namespace:
         "--clip-translational-actions",
         action=argparse.BooleanOptionalAction,
         default=False,
-        help="Legacy compatibility switch; current collection/evaluation leaves translation unclipped.",
+        help=(
+            "Legacy compatibility switch retained for old configs; model action "
+            "conversion now leaves all drone/dog speed and turn outputs unclipped."
+        ),
     )
     parser.add_argument("--drone-max-yaw-rate", type=float, default=0.4)
     parser.add_argument("--drone-camera-fixed-pitch", type=float, default=-60.0)
@@ -3027,24 +3848,197 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--follow-behind", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--face-target-before-step", action="store_true")
     parser.add_argument(
-        "--init-from-recorded-agent-poses",
+        "--oracle-heading-assist",
         action=argparse.BooleanOptionalAction,
         default=False,
-        help="For recorded target eval, restore drone/robotdog first-frame poses and cameras when present.",
+        help=(
+            "Debug ablation: keep model translation commands but replace drone yaw "
+            "and robotdog turn with target-bearing oracle commands."
+        ),
+    )
+    parser.add_argument(
+        "--oracle-drone-action-source",
+        choices=[
+            "none",
+            "env_action",
+            "drone_action",
+            "base_velocity",
+            "commanded_base_velocity",
+            "controller_commanded_base_velocity",
+            "original_env_action",
+            "original_base_velocity",
+        ],
+        default="none",
+        help=(
+            "Debug ablation: replace the model-produced drone env action with "
+            "the selected per-frame field from the recorded *_drone_info.json. "
+            "Use env_action to replay the exact command sent during collection."
+        ),
+    )
+    parser.add_argument(
+        "--oracle-drone-action-hold-last",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="When the eval episode outlives the recorded action list, keep replaying the last recorded drone action.",
+    )
+    parser.add_argument(
+        "--oracle-drone-velocity-dt",
+        type=float,
+        default=0.0,
+        help=(
+            "Override dt for converting 3D recorded velocity fields into BP_drone actions. "
+            "0 means use per-frame base_velocity_dt_s/effective_dt_s/dt when present, else --dt."
+        ),
+    )
+    parser.add_argument(
+        "--oracle-robotdog-action-source",
+        choices=[
+            "none",
+            "env_action",
+            "ground_action",
+            "controller_ground_action",
+            "commanded_base_velocity",
+            "controller_commanded_base_velocity",
+            "base_velocity",
+        ],
+        default="none",
+        help="Debug ablation: replace model robotdog action with the selected recorded *_robotdog_info.json field.",
+    )
+    parser.add_argument(
+        "--oracle-robotdog-action-hold-last",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="When eval outlives recorded robotdog actions, keep replaying the last recorded robotdog action.",
+    )
+    parser.add_argument(
+        "--oracle-robotdog-velocity-dt",
+        type=float,
+        default=0.0,
+        help=(
+            "Override dt for converting 3D recorded robotdog velocity fields into [turn_deg, speed_cm_s]. "
+            "0 means use per-frame base_velocity_dt_s/effective_dt_s/dt when present, else --dt."
+        ),
+    )
+    parser.add_argument(
+        "--oracle-recorded-step-timing",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Before each recorded-action step, apply the per-step recorded ue_interval_ms to target, robotdog and drone BP intervals.",
+    )
+    parser.add_argument(
+        "--drone-heading-assist-gain",
+        type=float,
+        default=1.2,
+        help="Proportional gain from drone heading error radians to yaw-rate command.",
+    )
+    parser.add_argument(
+        "--robotdog-heading-assist-gain",
+        type=float,
+        default=1.0,
+        help="Proportional gain from robotdog heading error degrees to turn command.",
+    )
+    parser.add_argument(
+        "--init-from-recorded-agent-poses",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "For recorded target eval, restore each episode's drone/robotdog "
+            "first-frame poses and complete recorded cameras, falling back to "
+            "ideal poses or default camera search when metadata is missing."
+        ),
     )
     parser.add_argument(
         "--init-followers-behind-target",
         action=argparse.BooleanOptionalAction,
-        default=True,
+        default=False,
         help=(
             "For recorded target eval, place drone/robotdog behind the target's "
-            "first sampled path segment at each min/max follow-distance midpoint."
+            "first sampled path segment using the configured init distance."
         ),
+    )
+    parser.add_argument(
+        "--init-follower-distance",
+        type=float,
+        default=4.5,
+        help=(
+            "Default behind-target spawn distance in meters for both drone and robotdog. "
+            "Set to <=0 to fall back to each min/max follow-distance midpoint."
+        ),
+    )
+    parser.add_argument(
+        "--init-drone-distance",
+        type=float,
+        default=None,
+        help="Optional drone-only behind-target spawn distance in meters.",
+    )
+    parser.add_argument(
+        "--init-robotdog-distance",
+        type=float,
+        default=None,
+        help="Optional robotdog-only behind-target spawn distance in meters.",
     )
 
     parser.add_argument("--waypoint-index", type=int, default=9)
     parser.add_argument("--drone-waypoint-index", type=int, default=9)
     parser.add_argument("--robotdog-waypoint-index", type=int, default=9)
+    parser.add_argument(
+        "--robotdog-waypoint-y-mode",
+        choices=("v3_nonholonomic_projection",),
+        default="v3_nonholonomic_projection",
+        help="Project V3 RobotDog pose waypoints to executable nonholonomic motion.",
+    )
+    parser.add_argument(
+        "--waypoint-control-mode",
+        choices=["inverse_fixed_dt", "direct_velocity"],
+        default="inverse_fixed_dt",
+        help=(
+            "inverse_fixed_dt maps model waypoints through the calibrated UE/BP inverse dynamics; "
+            "direct_velocity preserves the previous waypoint/time adapter."
+        ),
+    )
+    parser.add_argument(
+        "--ground-translation-delay-steps",
+        type=int,
+        choices=[0, 1],
+        default=1,
+        help="Observed robotdog BP forward-speed delay used by inverse_fixed_dt.",
+    )
+    parser.add_argument(
+        "--ground-yaw-gain",
+        type=float,
+        default=0.4,
+        help="Observed robotdog BP relation: realized_yaw_delta_deg = gain * turn_command_deg.",
+    )
+    parser.add_argument("--drone-inverse-a-forward", type=float, default=0.969)
+    parser.add_argument("--drone-inverse-b-forward", type=float, default=0.0301)
+    parser.add_argument("--drone-inverse-a-lateral", type=float, default=0.969)
+    parser.add_argument("--drone-inverse-b-lateral", type=float, default=0.0301)
+    parser.add_argument("--drone-inverse-yaw-a", type=float, default=0.464)
+    parser.add_argument("--drone-inverse-yaw-b", type=float, default=0.359)
+    parser.add_argument(
+        "--drone-inverse-xy-smoothing-alpha",
+        type=float,
+        default=0.2,
+        help="Causal low-pass alpha for model waypoint XY velocity before inverse dynamics; 1 disables smoothing.",
+    )
+    parser.add_argument(
+        "--drone-inverse-yaw-smoothing-alpha",
+        type=float,
+        default=0.25,
+        help="Causal low-pass alpha for model waypoint yaw rate before inverse dynamics; 1 disables smoothing.",
+    )
+    parser.add_argument(
+        "--robotdog-inverse-speed-smoothing-alpha",
+        type=float,
+        default=0.3,
+        help="Causal low-pass alpha for robotdog inverse forward/lateral waypoint velocity; 1 disables smoothing.",
+    )
+    parser.add_argument(
+        "--robotdog-inverse-yaw-smoothing-alpha",
+        type=float,
+        default=0.3,
+        help="Causal low-pass alpha for robotdog inverse yaw rate; 1 disables smoothing.",
+    )
     parser.add_argument(
         "--waypoint-horizon-steps",
         type=int,
@@ -3063,6 +4057,11 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--drone-vx-scale", type=float, default=1.0)
     parser.add_argument("--drone-vy-scale", type=float, default=1.0)
+    parser.add_argument("--drone-speed-gain", type=float, default=1.0)
+    parser.add_argument("--drone-velocity-feedback-gain", type=float, default=1.0)
+    parser.add_argument("--drone-yaw-feedback-gain", type=float, default=1.0)
+    parser.add_argument("--drone-feedback-max-translation", type=float, default=0.6)
+    parser.add_argument("--drone-feedback-max-yaw-rate", type=float, default=0.4)
     parser.add_argument("--drone-yaw-sign", type=float, default=1.0)
     parser.add_argument(
         "--drone-yaw-scale",
@@ -3078,16 +4077,79 @@ def parse_args() -> argparse.Namespace:
         help="Scale robotdog predicted yaw before converting to degrees and clipping.",
     )
     parser.add_argument("--robotdog-speed-gain", type=float, default=1.0)
+    parser.add_argument("--robotdog-velocity-feedback-gain", type=float, default=1.0)
+    parser.add_argument("--robotdog-yaw-feedback-gain", type=float, default=1.0)
+    parser.add_argument("--robotdog-feedback-max-translation", type=float, default=0.6)
+    parser.add_argument("--robotdog-feedback-max-yaw-rate", type=float, default=0.8)
+    parser.add_argument(
+        "--bbox-motion-control",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Enable causal V3 bbox feedback. Verified bbox cx affects yaw only; "
+            "height-based speed parameters are inactive."
+        ),
+    )
+    parser.add_argument("--bbox-motion-min-confidence", type=float, default=0.25)
+    parser.add_argument("--bbox-motion-ema-alpha", type=float, default=0.20)
+    parser.add_argument("--bbox-motion-min-valid-frames", type=int, default=2)
+    parser.add_argument("--bbox-motion-min-shrink-frames", type=int, default=3)
+    parser.add_argument(
+        "--bbox-motion-height-tolerance-ratio",
+        type=float,
+        default=0.20,
+        help="Relative dead band around each episode's first trusted bbox height.",
+    )
+    parser.add_argument(
+        "--bbox-motion-height-response-ratio",
+        type=float,
+        default=0.50,
+        help="Relative height deviation at which bbox speed correction saturates.",
+    )
+    parser.add_argument(
+        "--drone-bbox-height-normal",
+        type=float,
+        default=0.150,
+        help="Inactive compatibility parameter; V3 direction-only feedback ignores it.",
+    )
+    parser.add_argument(
+        "--drone-bbox-height-far",
+        type=float,
+        default=0.120,
+        help="Inactive compatibility parameter; V3 direction-only feedback ignores it.",
+    )
+    parser.add_argument("--drone-bbox-max-speed-gain", type=float, default=1.50, help="Inactive compatibility parameter; ignored by V3.")
+    parser.add_argument("--drone-bbox-min-speed-gain", type=float, default=0.50, help="Inactive compatibility parameter; ignored by V3.")
+    parser.add_argument("--drone-bbox-max-yaw-residual", type=float, default=0.12)
+    parser.add_argument(
+        "--robotdog-bbox-height-normal",
+        type=float,
+        default=0.220,
+        help="Inactive compatibility parameter; V3 direction-only feedback ignores it.",
+    )
+    parser.add_argument(
+        "--robotdog-bbox-height-far",
+        type=float,
+        default=0.160,
+        help="Inactive compatibility parameter; V3 direction-only feedback ignores it.",
+    )
+    parser.add_argument("--robotdog-bbox-max-speed-gain", type=float, default=1.25, help="Inactive compatibility parameter; ignored by V3.")
+    parser.add_argument("--robotdog-bbox-min-speed-gain", type=float, default=0.50, help="Inactive compatibility parameter; ignored by V3.")
+    parser.add_argument("--robotdog-bbox-max-yaw-residual", type=float, default=0.25)
     parser.add_argument("--drone-success-distance", type=float, default=5.5)
     parser.add_argument("--robotdog-success-distance", type=float, default=8.0)
-    parser.add_argument("--drone-lost-distance", type=float, default=8.0)
+    parser.add_argument("--drone-lost-distance", type=float, default=9.0)
     parser.add_argument("--robotdog-lost-distance", type=float, default=10.0)
     parser.add_argument(
         "--target-replay-mode",
-        choices=["nav_goal", "pose", "path_goal"],
-        default="path_goal",
+        choices=["nav_goal", "action", "path_goal"],
+        default="action",
         help="How to replay recorded target trajectories during closed-loop multi-agent eval.",
     )
+    parser.add_argument("--target-ground-translation-delay-steps", type=int, choices=(0, 1), default=1)
+    parser.add_argument("--target-ground-yaw-gain", type=float, default=0.4)
+    parser.add_argument("--target-inverse-position-feedback-time-s", type=float, default=0.5)
+    parser.add_argument("--target-inverse-max-forward-feedback-mps", type=float, default=2.0)
     parser.add_argument("--target-path-min-spacing", type=float, default=100.0)
     parser.add_argument("--target-path-reach-distance", type=float, default=120.0)
     parser.add_argument(
@@ -3136,7 +4198,7 @@ def main() -> int:
     if args.drone_max_vx is None:
         args.drone_max_vx = float(args.drone_max_speed)
     if args.drone_max_vy is None:
-        args.drone_max_vy = min(float(args.drone_max_speed), 0.5 * float(args.drone_max_speed))
+        args.drone_max_vy = float(args.drone_max_speed)
     print(
         f"[speed-profile] human={args.human_speed_mps:.2f}m/s "
         f"robotdog_max={args.robotdog_max_speed:.2f}m/s drone_max={args.drone_max_speed:.2f}m/s",
@@ -3152,8 +4214,36 @@ def main() -> int:
             "[control] snap_heading=False face_target_before_step=False yaw_control_mode=action",
             flush=True,
         )
+    print(
+        f"[control] waypoint_control_mode={args.waypoint_control_mode} "
+        f"ground_delay={args.ground_translation_delay_steps} "
+        f"ground_yaw_gain={args.ground_yaw_gain}",
+        flush=True,
+    )
+    if args.oracle_drone_action_source != "none":
+        print(
+            f"[control] oracle_drone_action_source={args.oracle_drone_action_source} "
+            f"hold_last={bool(args.oracle_drone_action_hold_last)}",
+            flush=True,
+        )
+    if args.oracle_robotdog_action_source != "none":
+        print(
+            f"[control] oracle_robotdog_action_source={args.oracle_robotdog_action_source} "
+            f"hold_last={bool(args.oracle_robotdog_action_hold_last)}",
+            flush=True,
+        )
+    if args.oracle_recorded_step_timing:
+        print("[control] oracle_recorded_step_timing=True", flush=True)
     if args.realtime_waypoint_timing and args.deterministic_step:
         raise ValueError("--realtime-waypoint-timing requires --no-deterministic-step")
+    if args.deterministic_pause_check_stride < 0:
+        raise ValueError("--deterministic-pause-check-stride must be >= 0")
+    if args.reuse_post_action_poses and (
+        not args.deterministic_step or not args.fast_eval_io
+    ):
+        raise ValueError(
+            "--reuse-post-action-poses requires --deterministic-step --fast-eval-io"
+        )
     if args.realtime_waypoint_min_seconds <= 0.0:
         raise ValueError("--realtime-waypoint-min-seconds must be positive")
     if args.realtime_waypoint_max_seconds < args.realtime_waypoint_min_seconds:
@@ -3162,9 +4252,70 @@ def main() -> int:
         )
     if args.waypoint_source_dt is not None and args.waypoint_source_dt <= 0.0:
         raise ValueError("--waypoint-source-dt must be positive")
+    if min(args.waypoint_index, args.drone_waypoint_index, args.robotdog_waypoint_index) < 1:
+        raise ValueError("waypoint index 0 is the local origin; choose a future waypoint index >= 1")
+    if args.waypoint_control_mode == "inverse_fixed_dt":
+        if not args.deterministic_step or abs(float(args.dt) - 0.1) > 1e-8:
+            raise ValueError("--waypoint-control-mode inverse_fixed_dt requires --deterministic-step --dt 0.1")
+        if args.realtime_waypoint_timing:
+            raise ValueError("inverse_fixed_dt does not support --realtime-waypoint-timing")
+        if args.ground_yaw_gain <= 0.0:
+            raise ValueError("--ground-yaw-gain must be positive")
+        if min(
+            args.drone_inverse_b_forward,
+            args.drone_inverse_b_lateral,
+            args.drone_inverse_yaw_b,
+        ) <= 0.0:
+            raise ValueError("drone inverse b coefficients must be positive")
+        for name in (
+            "drone_inverse_xy_smoothing_alpha",
+            "drone_inverse_yaw_smoothing_alpha",
+            "robotdog_inverse_speed_smoothing_alpha",
+            "robotdog_inverse_yaw_smoothing_alpha",
+        ):
+            value = float(getattr(args, name))
+            if not 0.0 < value <= 1.0:
+                raise ValueError(f"--{name.replace('_', '-')} must be in (0, 1]")
+    if args.oracle_drone_velocity_dt < 0.0:
+        raise ValueError("--oracle-drone-velocity-dt must be >= 0")
+    if args.oracle_robotdog_velocity_dt < 0.0:
+        raise ValueError("--oracle-robotdog-velocity-dt must be >= 0")
+    if args.oracle_drone_action_source != "none" and not args.recorded_target_dir:
+        raise ValueError("--oracle-drone-action-source requires --recorded-target-dir")
+    if args.oracle_robotdog_action_source != "none" and not args.recorded_target_dir:
+        raise ValueError("--oracle-robotdog-action-source requires --recorded-target-dir")
+    if args.oracle_recorded_step_timing and not args.recorded_target_dir:
+        raise ValueError("--oracle-recorded-step-timing requires --recorded-target-dir")
+    if args.human_collision_distance < 0.0:
+        raise ValueError("--human-collision-distance must be non-negative")
+    for name in (
+        "drone_speed_gain",
+        "drone_yaw_scale",
+        "robotdog_speed_gain",
+        "robotdog_yaw_scale",
+        "drone_velocity_feedback_gain",
+        "drone_yaw_feedback_gain",
+        "drone_feedback_max_translation",
+        "drone_feedback_max_yaw_rate",
+        "robotdog_velocity_feedback_gain",
+        "robotdog_yaw_feedback_gain",
+        "robotdog_feedback_max_translation",
+        "robotdog_feedback_max_yaw_rate",
+    ):
+        if float(getattr(args, name)) < 0.0:
+            raise ValueError(f"--{name.replace('_', '-')} must be non-negative")
     if args.deterministic_step:
+        fixed_interval_ms = int(round(float(args.dt) * 1000.0))
+        if args.ue_interval_ms is not None and int(args.ue_interval_ms) != fixed_interval_ms:
+            raise ValueError(
+                "deterministic evaluation requires --ue-interval-ms to equal "
+                f"round(--dt * 1000)={fixed_interval_ms}; got {args.ue_interval_ms}"
+            )
+        args.ue_interval_ms = fixed_interval_ms
         os.environ["UNREALZOO_FIXED_TIMESTEP"] = str(float(args.dt))
     else:
+        if args.ue_interval_ms is not None and int(args.ue_interval_ms) <= 0:
+            raise ValueError("--ue-interval-ms must be positive")
         os.environ.pop("UNREALZOO_FIXED_TIMESTEP", None)
     os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
     Path(args.save_path).mkdir(parents=True, exist_ok=True)

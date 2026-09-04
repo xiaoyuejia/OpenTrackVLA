@@ -1,0 +1,191 @@
+# Canonical V3 experiment: two isolated self streams plus one cooperative stream.
+# train_airground_coop_v3.py accepts only this architecture and semantic contract.
+architecture: airground_three_stream_cooperative_v3
+
+data:
+  train_json: /data/hdt/ntv_data/data/data7_8_camera_m40_pose_fixed_dt_exact_bbox_global_base_split_70_30/train/jsonl
+  val_json: /data/hdt/ntv_data/data/data7_8_camera_m40_pose_fixed_dt_exact_bbox_global_base_split_70_30/val/jsonl
+  cache_root: /data/hdt/ntv_data/data/data7_8_camera_m40_pose_fixed_dt_exact_bbox_global_base_split_70_30/train/vision_cache
+  val_cache_root: /data/hdt/ntv_data/data/data7_8_camera_m40_pose_fixed_dt_exact_bbox_global_base_split_70_30/val/vision_cache
+  perception_cache_root: /data/hdt/newtrackvla修改/newtrackvla_base_yh/offline_detection_segmentation/outputs/full_cache
+  train_episodes_manifest: /data/hdt/ntv_data/data/data7_8_camera_m40_pose_fixed_dt_exact_bbox_global_base_split_70_30/train_episodes.json
+  val_episodes_manifest: /data/hdt/ntv_data/data/data7_8_camera_m40_pose_fixed_dt_exact_bbox_global_base_split_70_30/val_episodes.json
+  expected_train_episodes: 2142
+  expected_val_episodes: 913
+  history: 31
+  n_waypoints: 10
+  action_dims: 3
+  image_size: 384
+  vision_resize_mode: letterbox
+  online_encode_missing: false
+  allow_missing_perception_cache: false
+  perception_grid_size: 8
+  # A valid YOLO person proposal is a positive tracked-target match only when
+  # its current-frame IoU with the GT target box reaches this value. GT is used
+  # only to create the training label and is never input to the model.
+  target_match_iou_threshold: 0.30
+  # Shared across STT/DT/AT: retain text-only cases so the matcher cannot
+  # ignore the instruction and rely exclusively on a perfect visual reference.
+  train_target_reference_dropout_prob: 0.20
+  val_target_reference_dropout_prob: 0.0
+  # Natural YOLO mismatch is very rare in this dataset. During training only,
+  # replace some correct proposals with low-IoU obstacle/corner proposals.
+  # Top-K real distractors replace the legacy top-1-only false-positive path.
+  train_synthetic_false_positive_prob: 0.0
+  val_synthetic_false_positive_prob: 0.0
+  # Adjacent current frames are highly redundant. Epoch e uses episode-local
+  # offset e%3, so every three epochs cover all frames exactly once before DDP padding.
+  train_temporal_stride: 5
+  coarse_cache_size: 8192
+  shuffle_block_size: 512
+  # When the curriculum enables synthetic assistance, select at most one
+  # receiver. The conditional draw is mutually exclusive: 50% drone / 50% dog.
+  train_synthetic_drone_occlusion_prob: 0.50
+  train_synthetic_dog_occlusion_prob: 0.50
+  val_synthetic_drone_occlusion_prob: 0.50
+  val_synthetic_dog_occlusion_prob: 0.50
+  occlusion_seed: 731
+  target_roi_expand_ratio: 1.50
+  # Epoch curriculum. Receiver probabilities above are conditional 50:50
+  # weights after assistance_probability decides whether to synthesize a receiver.
+  # Physical receiver relocation is sampled only for modes whose current frame
+  # is fully missing. ROI_ONLY retains its clean pose/background pair.
+  receiver_corruption_curriculum:
+    - end_epoch: 3
+      assistance_probability: 0.70
+      roi_only_probability: 0.70
+      current_full_probability: 0.30
+      recent_full_probability: 0.00
+      all_full_probability: 0.00
+      recent_history_lengths: [2]
+      pose_perturb_probability: 0.00
+      pose_translation_max_m: 0.25
+      pose_yaw_max_deg: 10.0
+    - end_epoch: 7
+      assistance_probability: 0.85
+      roi_only_probability: 0.40
+      current_full_probability: 0.30
+      recent_full_probability: 0.25
+      all_full_probability: 0.05
+      recent_history_lengths: [2, 4]
+      pose_perturb_probability: 0.50
+      pose_translation_max_m: 0.50
+      pose_yaw_max_deg: 30.0
+    - end_epoch: 1000000
+      assistance_probability: 0.90
+      roi_only_probability: 0.30
+      current_full_probability: 0.25
+      recent_full_probability: 0.35
+      all_full_probability: 0.10
+      recent_history_lengths: [2, 4, 8, 16]
+      pose_perturb_probability: 0.50
+      pose_translation_max_m: 0.50
+      pose_yaw_max_deg: 30.0
+  pose_global_rotation_max_deg: 180.0
+  pose_global_translation_max_m: 20.0
+
+model:
+  llm_name: Qwen/Qwen3-0.6B
+  vision_feat_dim: 1536
+  freeze_llm: true
+  use_angle_tvi: false
+  insert_time_tokens: true
+  no_tanh_actions: true
+  alpha_xy: 1.0
+  text_max_length: 128
+  instruction_override: Follow the person without collision.
+  agent1_instruction_override: Aerial drone independently follows the person without collision.
+  agent2_instruction_override: Ground robot dog independently follows the person without collision.
+  joint_instruction_override: Use both aerial and ground observations to follow the person without collision.
+  drone_target_verification_prompt: Compare all aerial-view person candidates using the target rule, history, and any valid start reference. The rule overrides a conflicting reference. For an appearance rule, match appearance; for an initial-target rule, preserve the first target identity. Score every candidate independently and accept only a sufficiently confident best match; ACT plans for the accepted target.
+  dog_target_verification_prompt: Compare all ground-view person candidates using the target rule, history, and any valid start reference. The rule overrides a conflicting reference. For an appearance rule, match appearance; for an initial-target rule, preserve the first target identity. Score every candidate independently and accept only a sufficiently confident best match; ACT plans for the accepted target.
+  use_agent_text_markers: true
+  num_modes: 4
+  drone_mask_expand_ratio: 3.0
+  dog_mask_expand_ratio: 3.0
+  perception_grid_size: 8
+  coop_hidden_dim: 512
+  coop_encoder_layers: 1
+  coop_decoder_layers: 3
+  coop_num_heads: 8
+  coop_dropout: 0.0
+  jepa_hidden_dim: 512
+  jepa_decoder_layers: 3
+  jepa_num_heads: 8
+  jepa_dropout: 0.0
+  jepa_momentum: 0.996
+  detection_confidence_threshold: 0.25
+  # At inference an agent is visible only when YOLO is valid/confident and the
+  # LLM target-verification probability reaches this threshold.
+  target_match_confidence_threshold: 0.50
+  hard_visibility_routing: true
+  pose_position_scale_m: 20.0
+  cooperative_target_frame_version: receiver_feasible_recovery_v1
+  receiver_corruption_version: roi_temporal_curriculum_v1
+  relative_pose_version: directed_receiver_local_v1
+
+optimization:
+  # Receiver-recovery training uses the canonical V3 output directory.
+  out_dir: output/airground_three_stream_cooperative_v3_receiver_target_qwen06b
+  # Ten rotating epochs equal three complete passes plus the offset-0 subset.
+  epochs: 10
+  # Selected physical batch after the shared ACT/VERIFY optimization:
+  # 48 x 2 GPUs x 2 accumulation = effective global batch 192.
+  batch_size: 48
+  grad_accum_steps: 2
+  # Learning rate for effective global batch 192.
+  lr: 4.0e-5
+  lr_scheduler: cosine
+  warmup_steps: 250
+  min_lr: 4.0e-6
+  weight_decay: 0.01
+  grad_clip: 1.0
+  mixed_precision: true
+  beta_nav: 100.0
+  beta_cooperative_waypoint: 100.0
+  beta_mode_classification: 1.0
+  beta_jepa: 1.0
+  beta_target_belief: 1.0
+  beta_target_match: 1.0
+  beta_uncertainty: 0.1
+  beta_smoothness: 0.1
+  beta_kinematics: 0.1
+  beta_diversity: 0.1
+  # YOLO mask grid is image-space while waypoints are local-motion coordinates.
+  # Keep disabled until calibrated image-to-ground projection is added.
+  beta_obstacle: 0.0
+  enable_projected_obstacle_loss: false
+  diversity_margin_m: 0.25
+  drone_max_speed_mps: 2.5
+  dog_max_speed_mps: 2.5
+  drone_max_yaw_rate_rps: 1.5
+  dog_max_yaw_rate_rps: 1.5
+  dog_lateral_tolerance_m: 0.05
+  drone_loss_weight: 1.0
+  dog_loss_weight: 1.0
+  normalize_agent_loss_weights: false
+  nav_loss_type: mse
+  smooth_l1_beta: 0.05
+  yaw_loss_weight: 1.0
+  # RobotDog y is a future local position. It is recovered from clean GT and
+  # converted to forward/turn control only at V3 inference time.
+  dog_lateral_loss_weight: 1.0
+  final_waypoint_loss_weight: 0.0
+
+runtime:
+  distributed: false
+  dist_backend: nccl
+  num_workers: 4
+  prefetch_factor: 2
+  seed: 731
+  log_every: 1
+  csv_logging: true
+  progress: false
+  compact_terminal_log: true
+  save_every: 0
+  save_every_epochs: 1
+  max_ckpts: 0
+  eval_every: 1000
+  eval_batches: 16
+  final_wp_threshold: 0.2
+  resume: false

@@ -1,0 +1,46 @@
+name: newtrackvla
+channels:
+  - conda-forge
+  - nodefaults
+dependencies:
+  - python=3.10
+  - pip
+  - pip:
+      # RTX PRO 6000 Blackwell (compute capability 12.0). CUDA 12.8 wheels
+      # are required; the repository's legacy torch 1.12.1 pin is not usable.
+      - --extra-index-url=https://download.pytorch.org/whl/cu128
+      - torch==2.8.0+cu128
+      - torchvision==0.23.0+cu128
+      - torchaudio==2.8.0+cu128
+      - numpy==1.26.4
+      - pillow>=9.5
+      - opencv-python==4.8.0.76
+      - scipy>=1.10
+      - pandas>=1.5
+      - matplotlib>=3.7
+      - PyYAML>=6.0
+      - transformers>=4.45,<5
+      - accelerate>=0.34
+      - safetensors>=0.4
+      - tokenizers>=0.22,<0.23
+      - ultralytics>=8.3,<9
+      - einops>=0.8
+      - tqdm>=4.0
+      - hydra-core>=1.2
+      - omegaconf>=2.2
+      - gym==0.10.9
+      - gymnasium>=1.0
+      - unrealcv>=1.2.0
+      - wget
+      - simple_pid
+      - pynput
+      - docker
+      - modelscope
+      - imageio
+      - imageio-ffmpeg
+      - numpy-quaternion
+      - numba>=0.44
+      - attrs>=19.1
+      - tensorboard
+      - pytest
+      - -e ./unrealzoo-gym

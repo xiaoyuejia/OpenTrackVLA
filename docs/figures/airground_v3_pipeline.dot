@@ -1,0 +1,339 @@
+digraph AirGroundV3Pipeline {
+  graph [
+    rankdir=TB,
+    newrank=true,
+    compound=true,
+    splines=ortho,
+    nodesep=0.26,
+    ranksep=0.42,
+    pad=0.20,
+    margin=0.04,
+    bgcolor="white",
+    fontname="DejaVu Sans",
+    fontsize=24,
+    labelloc="t",
+    labeljust="l",
+    label="AirGround-Coop V3: Three-Stream Cooperative Embodied Tracking\nDetailed training and closed-loop inference pipeline"
+  ];
+
+  node [
+    shape=box,
+    style="rounded,filled",
+    penwidth=1.4,
+    color="#38556A",
+    fillcolor="#F8FAFC",
+    fontname="DejaVu Sans",
+    fontsize=11,
+    fontcolor="#172B3A",
+    margin="0.13,0.08"
+  ];
+  edge [
+    color="#526D82",
+    penwidth=1.35,
+    arrowsize=0.72,
+    fontname="DejaVu Sans",
+    fontsize=9,
+    fontcolor="#334E60"
+  ];
+
+  subgraph cluster_input {
+    label="(a) Dual-agent observation encoding and typed token construction";
+    labelloc="t";
+    labeljust="l";
+    fontsize=15;
+    fontcolor="#16324F";
+    color="#AFC7D8";
+    fillcolor="#F5F9FC";
+    style="rounded,filled";
+    penwidth=1.5;
+    margin=16;
+
+    drone_rgb [
+      group="drone",
+      color="#277DA1",
+      fillcolor="#E6F3FC",
+      label="AERIAL DRONE\nRGB history (31 frames) + current frame"
+    ];
+    dog_rgb [
+      group="dog",
+      color="#4D908E",
+      fillcolor="#E8F5F1",
+      label="GROUND ROBOTDOG\nRGB history (31 frames) + current frame"
+    ];
+    poses [
+      color="#7B61A8",
+      fillcolor="#F1EAFE",
+      label="Follower poses in a shared metric frame\nPOSE_i = [x, y, sin(yaw), cos(yaw)]\ntraining: shared SE(2); inference: true centered poses"
+    ];
+    { rank=same; drone_rgb; dog_rgb; poses; }
+
+    vision [
+      color="#355C7D",
+      fillcolor="#EAF1F8",
+      label="Frozen visual front-end / cache\nDINOv2 + SigLIP -> concatenated 1536-D features\ngrid pooling: history coarse 4 tokens/frame; current fine 64 tokens"
+    ];
+    yolo [
+      color="#D08A26",
+      fillcolor="#FFF4DD",
+      label="YOLO instance segmentation\nperson proposal [cx,cy,w,h,score,valid] + ROI-pooled fine feature\n8x8 scene grid [unknown, free, obstacle, target]"
+    ];
+    { rank=same; vision; yolo; }
+
+    token_builder [
+      color="#536878",
+      fillcolor="#EEF3F6",
+      label="Shared multimodal tokenizer\nCross-modality projector + scene-grid projection + detection/ROI token\nTVI adds time / token-kind / agent identity (optional yaw embedding)\nTarget grid channel is removed before independent LLM verification"
+    ];
+
+    drone_rgb -> vision [color="#277DA1"];
+    dog_rgb -> vision [color="#4D908E"];
+    drone_rgb -> yolo [color="#277DA1"];
+    dog_rgb -> yolo [color="#4D908E"];
+    vision -> token_builder [label="coarse + fine"];
+    yolo -> token_builder [label="candidate + grid"];
+  }
+
+  subgraph cluster_model {
+    label="(b) Shared-weight Qwen3-0.6B with two isolated SELF rows and one joint COOPERATIVE context";
+    labelloc="t";
+    labeljust="l";
+    fontsize=15;
+    fontcolor="#16324F";
+    color="#9EB6C8";
+    fillcolor="#FBFCFD";
+    style="rounded,filled";
+    penwidth=1.5;
+    margin=18;
+
+    subgraph cluster_self {
+      label="SELF flows: clean observations, no cross-view attention";
+      fontsize=12;
+      fontcolor="#23506D";
+      color="#8EC4E2";
+      fillcolor="#F0F8FD";
+      style="rounded,filled";
+      margin=12;
+
+      self_rows [
+        color="#277DA1",
+        fillcolor="#E6F3FC",
+        label="Two causal rows packed on the batch axis (2B)\nDrone: text | H_D | C_D+grid | YOLO+ROI_D | VERIFY_D | ACT_D\nDog:    text | H_G | C_G+grid | YOLO+ROI_G | VERIFY_G | ACT_G\nVERIFY precedes ACT; the two visual contexts remain strictly isolated"
+      ];
+      self_llm [
+        color="#665191",
+        fillcolor="#EEE8FA",
+        penwidth=2.0,
+        label="Shared frozen Qwen3-0.6B\nSELF forward (one call)"
+      ];
+      verify [
+        color="#D08A26",
+        fillcolor="#FFF4DD",
+        label="Per-agent target-match head\nP(YOLO proposal = tracked target)\nuses VERIFY hidden state"
+      ];
+      self_head [
+        color="#277DA1",
+        fillcolor="#E6F3FC",
+        label="Two independent 3-layer action heads\nACT_D -> drone self trajectory\nACT_G -> dog self trajectory\n10 local [x,y,yaw] waypoints; waypoint[0]=0"
+      ];
+
+      self_rows -> self_llm;
+      self_llm -> verify [label="VERIFY states"];
+      self_llm -> self_head [label="ACT states"];
+    }
+
+    subgraph cluster_coop {
+      label="COOPERATIVE flow: source-guided receiver recovery";
+      fontsize=12;
+      fontcolor="#5B3F87";
+      color="#B7A1DD";
+      fillcolor="#F8F4FD";
+      style="rounded,filled";
+      margin=12;
+
+      augmentation [
+        color="#D7654D",
+        fillcolor="#FDEBE7",
+        penwidth=1.7,
+        label="TRAINING-ONLY paired corruption\nFor every eligible sample choose exactly one receiver (drone/dog = 0.5/0.5)\nreceiver H/C -> learned [MISSING]; detection/ROI -> 0; grid -> unknown\nreceiver pose += local delta(x,y,yaw); source observation and pose stay clean"
+      ];
+      coop_seq [
+        color="#7B61A8",
+        fillcolor="#F1EAFE",
+        label="Single joint causal sequence (B)\nJoint text | stream_D | stream_G | POSE_D | POSE_G | COOP_ACT_D | COOP_ACT_G\nBoth views and both follower poses interact inside the LLM"
+      ];
+      coop_llm [
+        color="#665191",
+        fillcolor="#EEE8FA",
+        penwidth=2.0,
+        label="Same frozen Qwen3-0.6B weights\nCOOPERATIVE forward (second call)"
+      ];
+      jepa [
+        color="#A65D9E",
+        fillcolor="#F8EAF6",
+        label="Conditional JEPA predictor (per agent)\ncooperative memory + masked receiver fine queries\n-> recovered receiver fine-grid latent tokens"
+      ];
+      ema [
+        color="#9B7B32",
+        fillcolor="#FFF7DF",
+        style="rounded,filled,dashed",
+        label="Stop-gradient EMA teacher projector (m=0.996)\nclean receiver fine tokens"
+      ];
+      belief [
+        color="#A65D9E",
+        fillcolor="#F8EAF6",
+        label="Attention pool recovered latent\n-> 5-D target-belief head\n-> uncertainty (log-variance) head"
+      ];
+      decoder_mem [
+        color="#6E5AA3",
+        fillcolor="#F0EAFA",
+        label="Decoder memory per agent\njoint LLM streams + both pose states\n+ recovered JEPA tokens + obstacle-grid tokens"
+      ];
+      coop_decoder [
+        color="#7B61A8",
+        fillcolor="#F1EAFE",
+        label="Two independent multimodal Transformer decoders\nCOOP_ACT context + mode/waypoint queries\nK=4 candidate trajectories + K mode logits\nargmax mode -> cooperative [x,y,yaw] trajectory"
+      ];
+
+      augmentation -> coop_seq;
+      coop_seq -> coop_llm;
+      coop_llm -> jepa [label="joint memory + ACT_i"];
+      jepa -> belief [label="recovered latent"];
+      coop_llm -> decoder_mem [label="joint hidden states"];
+      jepa -> decoder_mem;
+      decoder_mem -> coop_decoder;
+      coop_llm -> coop_decoder [label="COOP_ACT_i"];
+      ema -> jepa [style=dashed, color="#9B7B32", label="cosine target", constraint=false];
+    }
+
+    { rank=same; self_rows; augmentation; }
+    { rank=same; self_llm; coop_llm; }
+    { rank=same; verify; self_head; jepa; ema; }
+  }
+
+  token_builder -> self_rows [lhead=cluster_self, label="clean stream_D / stream_G"];
+  token_builder -> augmentation [lhead=cluster_coop, label="clean streams"];
+  token_builder -> ema [style=dashed, color="#9B7B32", label="clean fine tokens", constraint=false];
+  poses -> coop_seq [color="#7B61A8", label="two pose tokens"];
+
+  subgraph cluster_objectives {
+    label="(c) Training objectives and supervision boundary";
+    labelloc="t";
+    labeljust="l";
+    fontsize=15;
+    fontcolor="#16324F";
+    color="#D6B65D";
+    fillcolor="#FFFDF6";
+    style="rounded,filled";
+    penwidth=1.5;
+    margin=16;
+
+    self_loss [
+      color="#277DA1",
+      fillcolor="#E6F3FC",
+      label="Clean SELF waypoint loss\nBoth clean agent rows when valid\nL_self = L_wp(tau_self, tau_clean)"
+    ];
+    verify_loss [
+      color="#D08A26",
+      fillcolor="#FFF4DD",
+      label="Target verification BCE\npositive iff IoU(YOLO, GT) >= 0.30\nGT box is label-only; 0.25 train hard-negative injection"
+    ];
+    coop_loss [
+      color="#7B61A8",
+      fillcolor="#F1EAFE",
+      label="Receiver cooperative best-of-K + mode CE\nclean future world path re-expressed in perturbed receiver frame\np' = R(-delta_yaw)(p_clean-delta_xy), yaw'=wrap(yaw-delta_yaw)"
+    ];
+    aux_loss [
+      color="#A65D9E",
+      fillcolor="#F8EAF6",
+      label="Masked-receiver auxiliary losses\nJEPA cosine + target-belief Smooth-L1 + uncertainty NLL\ntrajectory regularizers: smoothness + kinematics + diversity\nimage-space obstacle collision loss remains disabled (weight=0)"
+    ];
+    total_loss [
+      color="#B68A16",
+      fillcolor="#FFF2C5",
+      penwidth=2.0,
+      label="Weighted training objective\nL = 100 L_self + 100 L_coop + L_mode + L_JEPA + L_belief\n    + L_verify + 0.1 L_unc + 0.1(L_smooth + L_kin + L_div)"
+    ];
+
+    { rank=same; self_loss; verify_loss; coop_loss; aux_loss; }
+    self_loss -> total_loss;
+    verify_loss -> total_loss;
+    coop_loss -> total_loss;
+    aux_loss -> total_loss;
+  }
+
+  self_head -> self_loss [color="#277DA1"];
+  verify -> verify_loss [color="#D08A26"];
+  coop_decoder -> coop_loss [color="#7B61A8"];
+  jepa -> aux_loss [color="#A65D9E"];
+  belief -> aux_loss [color="#A65D9E"];
+  ema -> aux_loss [style=dashed, color="#9B7B32", constraint=false];
+
+  subgraph cluster_inference {
+    label="(d) Closed-loop inference: verified visibility routing and embodiment-aware control";
+    labelloc="t";
+    labeljust="l";
+    fontsize=15;
+    fontcolor="#16324F";
+    color="#6BB8A8";
+    fillcolor="#F3FCFA";
+    style="rounded,filled";
+    penwidth=1.5;
+    margin=16;
+
+    inference_note [
+      color="#2A9D8F",
+      fillcolor="#E5F7F3",
+      label="INFERENCE: no synthetic mask and no pose perturbation\nSELF and COOPERATIVE trajectories are computed in the same frame"
+    ];
+    visibility [
+      color="#2A9D8F",
+      fillcolor="#E5F7F3",
+      label="Per-session visibility hysteresis\nvisible_i = YOLO valid/confident AND LLM target-match accepted\nseparate enter/exit thresholds + 2-frame visible/invisible confirmation"
+    ];
+    router [
+      color="#168777",
+      fillcolor="#DDF5F0",
+      penwidth=2.0,
+      label="Four-state trajectory router\n1) both verified: SELF_D + SELF_G\n2) one invisible: visible agent SELF; receiver COOPERATIVE\n3) both invisible <=3 frames: BELIEF (reuse last reliable trajectory)\n4) prolonged loss: SEARCH (yaw-only sweep about loss heading, +/-30 deg)"
+    ];
+    controller [
+      color="#2A9D8F",
+      fillcolor="#E5F7F3",
+      label="Waypoint-to-action control\nselected 10x[x,y,yaw] -> RobotDog y adapter (configurable)\n-> inverse fixed-dt controller -> LLM-verified bbox residual correction\n-> hard speed limit 2.5 m/s -> drone / RobotDog actions"
+    ];
+    rollout [
+      color="#38556A",
+      fillcolor="#EEF3F6",
+      label="UnrealZoo closed loop\nnew RGB + follower poses + temporal histories\n(max-lost-steps=400: sequence normally runs to completion)"
+    ];
+
+    inference_note -> visibility;
+    visibility -> router;
+    router -> controller;
+    controller -> rollout;
+    rollout -> inference_note [style=dashed, color="#2A9D8F", label="next observation", constraint=false];
+  }
+
+  verify -> visibility [color="#2A9D8F", label="target-match p_i"];
+  yolo -> visibility [color="#2A9D8F", label="online proposal"];
+  self_head -> router [color="#277DA1", label="self trajectories"];
+  coop_decoder -> router [color="#7B61A8", label="cooperative trajectories"];
+
+  legend [
+    shape=plain,
+    margin=0,
+    label=<
+      <TABLE BORDER="0" CELLBORDER="1" CELLSPACING="0" CELLPADDING="5" COLOR="#AAB7C1">
+        <TR><TD BGCOLOR="#E6F3FC"><FONT COLOR="#23506D">SELF / aerial path</FONT></TD>
+            <TD BGCOLOR="#E8F5F1"><FONT COLOR="#2C6865">ground-agent input</FONT></TD>
+            <TD BGCOLOR="#F1EAFE"><FONT COLOR="#5B3F87">COOPERATIVE path</FONT></TD>
+            <TD BGCOLOR="#FDEBE7"><FONT COLOR="#9E4938">training-only corruption</FONT></TD>
+            <TD BGCOLOR="#E5F7F3"><FONT COLOR="#187B6D">inference routing</FONT></TD>
+            <TD BGCOLOR="#FFF7DF"><FONT COLOR="#795E1E">dashed = EMA / stop-gradient / temporal loop</FONT></TD></TR>
+      </TABLE>
+    >
+  ];
+
+  total_loss -> legend [style=invis];
+  controller -> legend [style=invis];
+}

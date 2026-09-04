@@ -1,0 +1,32 @@
+dataset:
+  root: /data/hdt/ntv_data/data/data7_8_camera_m40_pose_fixed_dt_exact_bbox_global_base_split_70_30
+  output_root: offline_detection_segmentation/outputs/full_cache
+  splits: [train, val]
+
+models:
+  # Closed-set YOLO instance segmentation avoids treating sky/ground as open-set objects.
+  yolo_weights: offline_detection_segmentation/weights/yolo11m-seg.pt
+  yolo_image_size: 960
+
+runtime:
+  device: cuda:0
+  half: true
+  batch_size: 4
+
+thresholds:
+  # The unique highest-confidence person is the tracked target.
+  person_confidence: 0.25
+  # Every other detected foreground instance becomes an obstacle, regardless of class.
+  object_confidence: 0.25
+
+target:
+  person_labels: [person]
+
+output:
+  grid_size: [8, 8]
+  # Every cache gets a JPEG inspection image under output_root/visualizations/.
+  save_visualizations: true
+  visualization_alpha: 0.45
+  visualization_jpeg_quality: 90
+  # Keep false for a clean obstacle/target inspection view; unknown remains in .npz.
+  visualize_unknown: false

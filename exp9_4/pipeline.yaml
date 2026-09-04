@@ -1,0 +1,74 @@
+pipeline:
+  name: airground_v3_exp9_4_s5_e10
+  project_root: /data/yh/newtrackvla修改/newtrackvla_base_yh_clean
+  python: /home/yh/miniconda3/envs/newtrackvla/bin/python
+  order: [train, eval_dt, eval_at, eval_stt, summarize]
+
+paths:
+  train_config_template: /data/yh/newtrackvla修改/newtrackvla_base_yh_clean/exp9_4/config/train_s5_e10.yaml
+  effective_train_config: /data/yh/newtrackvla修改/newtrackvla_base_yh_clean/exp9_4/state/effective_train.yaml
+  model_dir: /data/yh/newtrackvla修改/newtrackvla_base_yh_clean/exp9_4/models/airground_v3_s5_e10
+  result_root: /data/yh/newtrackvla修改/newtrackvla_base_yh_clean/exp9_4/results
+  runtime_root: /data/yh/newtrackvla修改/newtrackvla_base_yh_clean/exp9_4/runtime
+  log_root: /data/yh/newtrackvla修改/newtrackvla_base_yh_clean/exp9_4/logs
+  state_root: /data/yh/newtrackvla修改/newtrackvla_base_yh_clean/exp9_4/state
+  summary_root: /data/yh/newtrackvla修改/newtrackvla_base_yh_clean/exp9_4/summaries
+
+train:
+  gpu_ids: "0,1"
+  temporal_stride: 5
+  sample_interval_seconds: 0.5
+  waypoint_step_dt_seconds: 0.1
+  epochs: 10
+  batch_size_per_gpu: 48
+  grad_accum_steps: 2
+  effective_global_batch: 192
+  # 所有 AirGround V3 可训练模块从头初始化；冻结的 Qwen 主干仍加载正常预训练权重。
+  init_mode: scratch
+  init_search_dir: null
+  init_pattern: model_epoch*_final.pt
+  require_init_checkpoint: false
+  expected_final_epoch: 10
+  receiver_curriculum: progressive_linear_10stage_v1
+  target_reference: disabled
+  # 每个 epoch 增加一个等间隔难度台阶；第 10 epoch 达到原 hard-stage。
+  receiver_curriculum_stages: 10
+
+# 三组评估严格串行，顺序固定为 DT -> AT -> STT。
+evaluation:
+  gpu_ids: "0,1"
+  render_gpu_ids: "0,1"
+  workers_per_gpu: 1
+  worker_start_stagger_sec: 15
+  scene_timeout_seconds: 12600
+  scene_retries: 5
+  policy_inference_stride: 5
+  policy_interval_seconds: 0.5
+  environment_step_dt_seconds: 0.1
+  history_frame_dt_seconds: 0.1
+  waypoint_step_dt_seconds: 0.1
+  waypoint_horizon_steps: 7
+  target_match_confidence_threshold: 0.50
+  policy_action_rollout: future_segment
+  # Qwen 每 0.5 s 推理一次，但中间 0.1 s RGB 仍用于补充训练同分布的视觉历史。
+  skip_rgb_between_policy_steps: false
+  metric_mask_stride: 1
+  width: 640
+  height: 480
+  fps: 10
+  save_video: true
+  write_global_video: true
+  trajectory_overlay: true
+  resume_completed: true
+  drone_min_follow_dist_m: 1.0
+  drone_max_follow_dist_m: 6.0
+  robotdog_min_follow_dist_m: 1.0
+  robotdog_max_follow_dist_m: 6.0
+  manifests:
+    dt: /data/yh/newtrackvla修改/newtrackvla_base_yh_clean/exp9_4/manifests/eval_dt_500_recorded.json
+    at: /data/yh/newtrackvla修改/newtrackvla_base_yh_clean/exp9_4/manifests/eval_at_500_recorded.json
+    stt: /data/yh/newtrackvla修改/newtrackvla_base_yh_clean/exp9_4/manifests/eval_stt_1400_recorded.json
+  expected_episodes:
+    dt: 500
+    at: 500
+    stt: 1400

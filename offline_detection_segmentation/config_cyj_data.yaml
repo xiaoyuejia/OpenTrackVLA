@@ -1,0 +1,30 @@
+dataset:
+  # The staging tree mirrors the JSONL contract expected by precompute.py.
+  root: /tmp/cyj_perception_input
+  output_root: /data/hdt/ntv_data/data/cyj_data_arr_processed/perception_cache
+  splits: [train]
+
+models:
+  yolo_weights: /data/hdt/newtrackvla修改/newtrackvla_base_yh_clean/offline_detection_segmentation/weights/yolo11m-seg.pt
+  yolo_image_size: 960
+
+runtime:
+  device: cuda:0
+  half: true
+  batch_size: 128
+
+thresholds:
+  person_confidence: 0.25
+  object_confidence: 0.25
+
+target:
+  person_labels: [person]
+
+output:
+  grid_size: [8, 8]
+  # Visualization JPEGs are not needed for training and would substantially
+  # increase disk I/O and wall-clock time for 5.5M source images.
+  save_visualizations: false
+  visualization_alpha: 0.45
+  visualization_jpeg_quality: 90
+  visualize_unknown: false

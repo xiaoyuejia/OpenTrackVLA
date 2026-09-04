@@ -7,6 +7,7 @@ import argparse
 import json
 import sys
 import time
+from contextlib import nullcontext
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
@@ -144,13 +145,23 @@ def _encode_single(pil: Image.Image, enc: VisionFeatureCacher) -> Tuple[torch.Te
 
 
 @torch.inference_mode()
-def _encode_batch(pils: List[Image.Image], enc: VisionFeatureCacher) -> Tuple[torch.Tensor, torch.Tensor]:
+def _encode_batch(
+    pils: List[Image.Image],
+    enc: VisionFeatureCacher,
+    amp_dtype: Optional[torch.dtype] = None,
+) -> Tuple[torch.Tensor, torch.Tensor]:
     """批量编码图片，返回 CPU 上的 coarse/fine token。"""
-    tok_dino, hp, wp = enc._encode_dino(pils)
-    tok_sigl = enc._encode_siglip(pils, out_hw=(hp, wp))
-    tokens = torch.cat([tok_dino, tok_sigl], dim=-1)
-    vfine = grid_pool_tokens(tokens, hp, wp, out_tokens=64)
-    vcoarse = grid_pool_tokens(tokens, hp, wp, out_tokens=4)
+    amp_context = (
+        torch.autocast(device_type="cuda", dtype=amp_dtype)
+        if amp_dtype is not None and enc.device.type == "cuda"
+        else nullcontext()
+    )
+    with amp_context:
+        tok_dino, hp, wp = enc._encode_dino(pils)
+        tok_sigl = enc._encode_siglip(pils, out_hw=(hp, wp))
+        tokens = torch.cat([tok_dino, tok_sigl], dim=-1)
+        vfine = grid_pool_tokens(tokens, hp, wp, out_tokens=64)
+        vcoarse = grid_pool_tokens(tokens, hp, wp, out_tokens=4)
     return vcoarse.cpu().float(), vfine.cpu().float()
 
 
@@ -413,7 +424,7 @@ def collect_multi_agent_frame_refs(
     abs_paths: Set[Path] = set()
     for rel in rel_paths:
         p = Path(rel)
-        abs_paths.add(p if p.is_absolute() else (data_root / p).resolve())
+        abs_paths.add(p if p.is_absolute() else (data_root / p).absolute())
 
     if scan_frames or not abs_paths:
         frames_dir = data_root / "frames"
@@ -456,7 +467,50 @@ def collect_multi_agent_roi_refs(
     out: Dict[Path, Dict[str, Any]] = {}
     for rel, payload in roi_refs.items():
         p = Path(rel)
-        out[p if p.is_absolute() else (data_root / p).resolve()] = payload
+        out[p if p.is_absolute() else (data_root / p).absolute()] = payload
+    return out
+
+
+def collect_multi_agent_roi_refs_from_raw(data_root: Path, raw_root: Path) -> Dict[Path, Dict[str, Any]]:
+    """Build exact normalized bbox refs directly from raw per-step info JSON.
+
+    Raw ``target_bbox`` is pixel ``xywh`` and the rendered frames are 640x480.
+    This avoids reparsing the very large processed JSONL files when the raw
+    episode metadata is available.
+    """
+    out: Dict[Path, Dict[str, Any]] = {}
+    frames_root = data_root / "frames"
+    for scene_dir in sorted(p for p in frames_root.iterdir() if p.is_dir()):
+        raw_scene = raw_root / scene_dir.name
+        for episode_dir in sorted(p for p in scene_dir.iterdir() if p.is_dir()):
+            for agent in ("drone", "robotdog"):
+                info_path = raw_scene / f"{episode_dir.name}_{agent}_info.json"
+                frame_dir = episode_dir / agent
+                if not info_path.is_file() or not frame_dir.is_dir():
+                    continue
+                try:
+                    rows = json.loads(info_path.read_text(encoding="utf-8"))
+                except Exception as exc:
+                    print(f"[warn] failed to read raw bbox info {info_path}: {exc}", flush=True)
+                    continue
+                frame_paths = sorted(frame_dir.glob("frame_*.jpg"))
+                for index, frame_path in enumerate(frame_paths):
+                    if index >= len(rows) or not isinstance(rows[index], dict):
+                        continue
+                    bbox = rows[index].get("target_bbox")
+                    if not isinstance(bbox, list) or len(bbox) < 4:
+                        continue
+                    try:
+                        x, y, w, h = [float(v) for v in bbox[:4]]
+                    except Exception:
+                        continue
+                    if w <= 0.0 or h <= 0.0:
+                        continue
+                    out[frame_path.resolve()] = {
+                        "bbox": [(x + 0.5 * w) / 640.0, (y + 0.5 * h) / 480.0, w / 640.0, h / 480.0],
+                        "bbox_format": "cxcywh_norm",
+                        "agent_name": agent,
+                    }
     return out
 
 
@@ -468,13 +522,16 @@ def rel_multi_agent_to_data_root(path: Path, data_root: Path) -> Path:
     cache: cache_root/frames/.../frame_00001_vfine.pt
     """
     try:
-        return path.resolve().relative_to(data_root.resolve())
+        return path.absolute().relative_to(data_root.absolute())
     except ValueError:
-        parts = path.parts
-        if "frames" in parts:
-            idx = parts.index("frames")
-            return Path(*parts[idx:])
-        return Path(path.name)
+        try:
+            return path.resolve().relative_to(data_root.resolve())
+        except ValueError:
+            parts = path.parts
+            if "frames" in parts:
+                idx = parts.index("frames")
+                return Path(*parts[idx:])
+            return Path(path.name)
 
 
 def save_multi_agent_tensor(path: Path, tensor: torch.Tensor, save_float32: bool) -> None:
@@ -578,11 +635,20 @@ def roi_cache_is_valid(
     roi_token_count: int,
     roi_expand_ratio: float,
     roi_make_square: bool,
+    expected_bbox: Any = None,
+    allow_legacy_missing_source_bbox: bool = False,
 ) -> bool:
     if not path.exists():
         return False
     try:
-        load_roi_cache(path, roi_token_count, roi_expand_ratio, roi_make_square)
+        load_roi_cache(
+            path,
+            roi_token_count,
+            roi_expand_ratio,
+            roi_make_square,
+            expected_bbox=expected_bbox,
+            allow_legacy_missing_source_bbox=allow_legacy_missing_source_bbox,
+        )
         return True
     except Exception:
         return False
@@ -598,7 +664,29 @@ def parse_multi_agent_precache_args() -> argparse.Namespace:
     parser.add_argument("--cache_root", type=str, default=None, help="Defaults to <data_root>/vision_cache.")
     parser.add_argument("--json_root", type=str, default=None, help="JSONL directory/file. Defaults to <data_root>/jsonl plus dataset.json.")
     parser.add_argument("--dataset_json", type=str, default=None)
+    parser.add_argument(
+        "--allow_legacy_roi_cache_without_source_bbox",
+        action="store_true",
+        help="Reuse legacy ROI payloads that match token/crop settings but predate source_bbox metadata.",
+    )
+    parser.add_argument(
+        "--trust_existing_roi_cache",
+        action="store_true",
+        help="Treat an existing ROI file as valid without torch.load; useful after an explicit cache audit.",
+    )
     parser.add_argument("--scan_frames", action="store_true", help="Also scan every image under <data_root>/frames.")
+    parser.add_argument(
+        "--frame_list",
+        type=str,
+        default=None,
+        help="Optional newline-delimited image list; avoids slow recursive pathlib scanning.",
+    )
+    parser.add_argument(
+        "--raw_root",
+        type=str,
+        default=None,
+        help="Optional raw episode root for direct target_bbox loading.",
+    )
     parser.add_argument("--image_size", type=int, default=384)
     parser.add_argument("--vision_resize_mode", choices=("letterbox", "stretch"), default="letterbox")
     parser.add_argument("--with_roi", action="store_true", help="Also generate current-frame target ROI token caches.")
@@ -610,6 +698,12 @@ def parse_multi_agent_precache_args() -> argparse.Namespace:
     parser.add_argument("--num_shards", type=int, default=1, help="Split frame list into this many disjoint shards.")
     parser.add_argument("--shard_id", type=int, default=0, help="Zero-based shard index processed by this worker.")
     parser.add_argument("--device", type=str, default=None, choices=["cpu", "cuda"])
+    parser.add_argument(
+        "--encoder_amp",
+        choices=("none", "bfloat16", "float16"),
+        default="none",
+        help="CUDA autocast dtype for DINO/SigLIP encoding; cache files keep the same FP16 format.",
+    )
     parser.add_argument("--limit", type=int, default=0)
     parser.add_argument("--save_float32", action="store_true")
     parser.add_argument("--image_workers", type=int, default=8, help="Threads for parallel image decode in multi-agent precache.")
@@ -643,8 +737,19 @@ def main_multi_agent_precache() -> None:
     if roi_side * roi_side != int(args.roi_token_count):
         raise ValueError("--roi_token_count must be a perfect square")
 
-    frame_paths = collect_multi_agent_frame_refs(data_root, json_root, dataset_json, args.scan_frames)
-    roi_refs = collect_multi_agent_roi_refs(data_root, json_root, dataset_json) if args.with_roi else {}
+    if args.frame_list:
+        frame_list_path = Path(args.frame_list).expanduser().resolve()
+        frame_paths = [Path(line.strip()).resolve() for line in frame_list_path.open("r", encoding="utf-8") if line.strip()]
+    else:
+        frame_paths = collect_multi_agent_frame_refs(data_root, json_root, dataset_json, args.scan_frames)
+    if args.with_roi:
+        roi_refs = (
+            collect_multi_agent_roi_refs_from_raw(data_root, Path(args.raw_root).resolve())
+            if args.raw_root
+            else collect_multi_agent_roi_refs(data_root, json_root, dataset_json)
+        )
+    else:
+        roi_refs = {}
     if args.num_shards < 1 or not 0 <= args.shard_id < args.num_shards:
         raise ValueError(f"invalid shard_id={args.shard_id} for num_shards={args.num_shards}")
     all_frame_count = len(frame_paths)
@@ -681,6 +786,11 @@ def main_multi_agent_precache() -> None:
         )
     )
     enc.eval()
+    amp_dtype = {
+        "none": None,
+        "bfloat16": torch.bfloat16,
+        "float16": torch.float16,
+    }[args.encoder_amp]
 
     checked = 0
     generated = 0
@@ -734,12 +844,21 @@ def main_multi_agent_precache() -> None:
 
                 if args.with_roi and img_path in roi_refs:
                     vroi_path = token_dir / f"{rel.stem}_vroi.pt"
-                    if args.overwrite_roi or not roi_cache_is_valid(
-                        vroi_path,
-                        args.roi_token_count,
-                        args.roi_expand_ratio,
-                        bool(args.roi_make_square),
-                    ):
+                    existing_roi_valid = (
+                        vroi_path.exists()
+                        if args.trust_existing_roi_cache
+                        else roi_cache_is_valid(
+                            vroi_path,
+                            args.roi_token_count,
+                            args.roi_expand_ratio,
+                            bool(args.roi_make_square),
+                            expected_bbox=roi_refs[img_path].get("bbox"),
+                            allow_legacy_missing_source_bbox=bool(
+                                args.allow_legacy_roi_cache_without_source_bbox
+                            ),
+                        )
+                    )
+                    if args.overwrite_roi or not existing_roi_valid:
                         pending_roi.append((img_path, vroi_path, roi_refs[img_path]))
 
             read_futures = [image_pool.submit(load_multi_agent_rgb, item[0]) for item in pending_global]
@@ -754,7 +873,7 @@ def main_multi_agent_precache() -> None:
                     print(f"[warn] failed to read {item[0]}: {exc}", flush=True)
             if pils:
                 try:
-                    batch_vc, batch_vf = _encode_batch(pils, enc)
+                    batch_vc, batch_vf = _encode_batch(pils, enc, amp_dtype=amp_dtype)
                     for index, (_img_path, vfine_path, vcoarse_path) in enumerate(valid_pending):
                         save_futures.add(
                             save_pool.submit(
@@ -806,6 +925,7 @@ def main_multi_agent_precache() -> None:
                             bbox_format=str(meta.get("bbox_format", "cxcywh_norm")),
                             roi_valid=bool(roi_valid),
                             crop_xyxy=crop_xyxy,
+                            source_bbox=meta.get("bbox"),
                             save_float32=bool(args.save_float32),
                         )
                         save_futures.add(save_pool.submit(save_multi_agent_roi_payload, vroi_path, payload))

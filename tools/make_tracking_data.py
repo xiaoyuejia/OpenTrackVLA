@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 
 import argparse
+import bisect
+import hashlib
 import json
 import os
 import re
@@ -12,7 +14,36 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
+import numpy as np
 from PIL import Image
+
+try:
+    from tools.bbox_spatial import (
+        bbox_prompt_from_spatial,
+        bbox_spatial_fields,
+        normalize_bbox_xywh_to_cxcywh,
+    )
+except ModuleNotFoundError:  # Support `python tools/make_tracking_data.py`.
+    from bbox_spatial import (  # type: ignore
+        bbox_prompt_from_spatial,
+        bbox_spatial_fields,
+        normalize_bbox_xywh_to_cxcywh,
+    )
+
+try:
+    from tools.waypoint_inverse_dynamics import (
+        INVERSE_CONTROL_VERSION,
+        InverseDynamicsConfig,
+        initial_inverse_state,
+        inverse_step_numpy,
+    )
+except ModuleNotFoundError:  # Support `python tools/make_tracking_data.py`.
+    from waypoint_inverse_dynamics import (  # type: ignore
+        INVERSE_CONTROL_VERSION,
+        InverseDynamicsConfig,
+        initial_inverse_state,
+        inverse_step_numpy,
+    )
 
 
 @dataclass
@@ -24,8 +55,9 @@ class EpisodePaths:
     info_json: Path
 
 
-DEFAULT_MULTI_AGENT_INSTRUCTION = "Follow the target person without collision."
+DEFAULT_MULTI_AGENT_INSTRUCTION = "Follow the person."
 MULTI_AGENT_SCHEMA_VERSION = "multi_agent_tracking_v2_origin_waypoint"
+RECORDED_POSE_SCHEMA_VERSION = "multi_agent_tracking_v5_global_waypoint"
 ACTION_FIELD_AUTO = "auto"
 
 
@@ -73,6 +105,8 @@ def ensure_dir(path: Path):
 def extract_frames_ffmpeg(ffmpeg_path: str, mp4_path: Path, out_dir: Path, quality: int = 2) -> List[Path]:
     """Extract all frames from mp4 using ffmpeg. Returns list of frame paths."""
     ensure_dir(out_dir)
+    for stale_frame in list_sorted_images(out_dir):
+        stale_frame.unlink()
     pattern = str(out_dir / "frame_%05d.jpg")
     cmd = [
         ffmpeg_path,
@@ -133,10 +167,9 @@ def load_episode_status(status_json_path: Path) -> Optional[dict]:
 def action_field_order(preferred_field: Optional[str]) -> List[str]:
     """Return action label preference.
 
-    This is the static fallback order used for Habitat and legacy rows. Current
-    UnrealZoo rows carry ``command_label_source``/``env_action`` metadata and
-    ``extract_action3_from_step`` explicitly prefers
-    ``commanded_base_velocity`` for those rows.
+    This is the default order used for Habitat, legacy rows, and current
+    UnrealZoo rows. Pass ``--action_field commanded_base_velocity`` explicitly
+    when that command label should be preferred.
     """
     preferred = (preferred_field or ACTION_FIELD_AUTO).strip()
     if not preferred or preferred == ACTION_FIELD_AUTO:
@@ -154,7 +187,7 @@ def extract_action3_from_step(step: Dict[str, Any], preferred_field: Optional[st
     if (preferred_field or ACTION_FIELD_AUTO).strip() == ACTION_FIELD_AUTO and (
         step.get("command_label_source") or step.get("env_action") is not None
     ):
-        field_order = ["commanded_base_velocity", "base_velocity"]
+        field_order = ["base_velocity", "commanded_base_velocity"]
     else:
         field_order = action_field_order(preferred_field)
     for key in field_order:
@@ -462,6 +495,7 @@ def extract_multi_agent_frames_ffmpeg(
     out_dir: Path,
     quality: int,
     reuse_existing: bool,
+    expected_count: Optional[int] = None,
 ) -> List[Path]:
     """为单个 Agent 视频抽帧。
 
@@ -473,7 +507,11 @@ def extract_multi_agent_frames_ffmpeg(
     ensure_dir(out_dir)
     existing = list_sorted_images(out_dir)
     if reuse_existing and existing:
-        return existing
+        count_matches = expected_count is None or len(existing) == int(expected_count)
+        source_mtime = mp4_path.stat().st_mtime
+        frames_are_current = min(path.stat().st_mtime for path in existing) >= source_mtime
+        if count_matches and frames_are_current:
+            return existing
     return extract_frames_ffmpeg(ffmpeg_path, mp4_path, out_dir, quality=quality)
 
 
@@ -481,15 +519,15 @@ def to_multi_agent_action3(step: Dict[str, Any], agent_name: str, preferred_fiel
     """把 UnrealZoo info 中的动作字段统一成 [vx, vy, yaw_rate]。
 
     处理逻辑：
-    - 当前 UnrealZoo 行优先使用 commanded_base_velocity 专家命令。
-    - Habitat/旧数据在缺少命令元数据时优先使用 base_velocity。
+    - 默认 auto 优先使用 base_velocity。
+    - 如果需要当前 UnrealZoo 的控制器命令标签，显式传 --action_field commanded_base_velocity。
     - drone_action 常见为 4 维，此时第 4 维作为 yaw_rate。
     - 缺失或格式异常时补 0，保证后续积分稳定。
     """
     if (preferred_field or ACTION_FIELD_AUTO).strip() == ACTION_FIELD_AUTO and (
         step.get("command_label_source") or step.get("env_action") is not None
     ):
-        field_order = ["commanded_base_velocity", "base_velocity"]
+        field_order = ["base_velocity", "commanded_base_velocity"]
     else:
         field_order = action_field_order(preferred_field)
     if agent_name == "drone":
@@ -524,7 +562,25 @@ def build_multi_agent_actions(steps: List[Dict[str, Any]], agent_name: str, pref
     return [to_multi_agent_action3(step, agent_name, preferred_field) for step in steps]
 
 
-def integrate_multi_agent_actions(actions: List[List[float]], start_index: int, horizon_steps: int, dt: float) -> List[List[float]]:
+def multi_agent_step_dt(step: Dict[str, Any], fallback_dt: float) -> float:
+    """Return the simulation duration represented by one recorded row."""
+    for key in ("effective_dt_s", "base_velocity_dt_s", "fixed_timestep_seconds", "training_dt_s", "dt"):
+        try:
+            value = float(step.get(key))
+        except (TypeError, ValueError):
+            continue
+        if math.isfinite(value) and value > 0.0:
+            return value
+    return float(fallback_dt)
+
+
+def integrate_multi_agent_actions(
+    actions: List[List[float]],
+    start_index: int,
+    horizon_steps: int,
+    dt: float,
+    step_dts: Optional[List[float]] = None,
+) -> List[List[float]]:
     """把未来速度积分成局部路点标签。
 
     输入：
@@ -540,13 +596,344 @@ def integrate_multi_agent_actions(actions: List[List[float]], start_index: int, 
     end = min(len(actions), start_index + max(0, horizon_steps))
     for k in range(start_index, end):
         vx, vy, wz = actions[k]
+        step_dt = float(step_dts[k]) if step_dts is not None and k < len(step_dts) else float(dt)
         dx = vx * math.cos(theta) - vy * math.sin(theta)
         dy = vx * math.sin(theta) + vy * math.cos(theta)
-        x += dx * dt
-        y += dy * dt
-        theta += wz * dt
+        x += dx * step_dt
+        y += dy * step_dt
+        theta += wz * step_dt
         points.append([x, y, theta])
     return points
+
+
+def advance_local_pose(
+    pose: List[float],
+    action: List[float],
+    duration_s: float,
+) -> List[float]:
+    """Advance a local SE(2) pose with a body-frame velocity command."""
+    x, y, theta = [float(value) for value in pose[:3]]
+    vx, vy, wz = [float(value) for value in action[:3]]
+    duration_s = float(duration_s)
+    dx = vx * math.cos(theta) - vy * math.sin(theta)
+    dy = vx * math.sin(theta) + vy * math.cos(theta)
+    return [
+        x + dx * duration_s,
+        y + dy * duration_s,
+        theta + wz * duration_s,
+    ]
+
+
+def integrate_actions_at_fixed_times(
+    actions: List[List[float]],
+    step_dts: List[float],
+    start_index: int,
+    output_dt: float,
+    n_waypoints: int,
+) -> Tuple[List[List[float]], List[int]]:
+    """Integrate variable-duration actions and sample at fixed future times.
+
+    Output waypoint ``i`` always represents ``i * output_dt`` seconds from the
+    current observation.  The returned source indices identify every recorded
+    action interval consumed to cover the fixed-time horizon.
+    """
+    if n_waypoints <= 0:
+        return [], []
+    if output_dt <= 0.0:
+        raise ValueError(f"output_dt must be positive, got {output_dt}")
+
+    points: List[List[float]] = [[0.0, 0.0, 0.0]]
+    source_indices: List[int] = []
+    state = [0.0, 0.0, 0.0]
+    elapsed = 0.0
+    next_output_index = 1
+    index = int(start_index)
+    epsilon = 1e-9
+
+    while next_output_index < n_waypoints and index < len(actions) and index < len(step_dts):
+        duration = float(step_dts[index])
+        if not math.isfinite(duration) or duration <= 0.0:
+            break
+        action = actions[index]
+        segment_start_state = state
+        segment_end = elapsed + duration
+        source_indices.append(index)
+
+        while next_output_index < n_waypoints:
+            target_time = next_output_index * float(output_dt)
+            if target_time > segment_end + epsilon:
+                break
+            points.append(
+                advance_local_pose(
+                    segment_start_state,
+                    action,
+                    max(0.0, target_time - elapsed),
+                )
+            )
+            next_output_index += 1
+
+        state = advance_local_pose(segment_start_state, action, duration)
+        elapsed = segment_end
+        index += 1
+
+    return points, source_indices
+
+
+def build_observation_times(step_dts: List[float]) -> List[float]:
+    """Return observation times where row ``i`` starts at ``times[i]``."""
+    times = [0.0]
+    for duration in step_dts[:-1]:
+        value = float(duration)
+        if not math.isfinite(value) or value <= 0.0:
+            value = 0.0
+        times.append(times[-1] + value)
+    return times
+
+
+def fixed_time_history_indices(
+    observation_times: List[float],
+    current_index: int,
+    history: int,
+    frame_dt: float,
+) -> List[int]:
+    """Select previous observations nearest to fixed past-time offsets."""
+    if history <= 0 or current_index <= 0:
+        return []
+    if frame_dt <= 0.0:
+        raise ValueError(f"history frame dt must be positive, got {frame_dt}")
+    current_time = float(observation_times[current_index])
+    available = observation_times[:current_index]
+    indices: List[int] = []
+    for slot in range(history, 0, -1):
+        target_time = current_time - slot * float(frame_dt)
+        right = bisect.bisect_left(available, target_time)
+        if right <= 0:
+            chosen = 0
+        elif right >= len(available):
+            chosen = len(available) - 1
+        else:
+            left = right - 1
+            chosen = left if target_time - available[left] <= available[right] - target_time else right
+        indices.append(chosen)
+    return indices
+
+
+def pose_xy_distance_m(first: Any, second: Any) -> Optional[float]:
+    if not isinstance(first, list) or not isinstance(second, list) or len(first) < 2 or len(second) < 2:
+        return None
+    try:
+        dx = float(first[0]) - float(second[0])
+        dy = float(first[1]) - float(second[1])
+    except (TypeError, ValueError):
+        return None
+    return math.hypot(dx, dy) / 100.0
+
+
+def wrap_radians(value: float) -> float:
+    return (float(value) + math.pi) % (2.0 * math.pi) - math.pi
+
+
+def recorded_pose_waypoints(
+    steps: List[Dict[str, Any]],
+    agent_name: str,
+    start_index: int,
+    n_waypoints: int,
+) -> Tuple[List[List[float]], List[bool], List[int]]:
+    """Build local waypoints from consecutive recorded poses without interpolation.
+
+    Row ``start_index + k`` is declared to represent ``k * 0.1s`` by the
+    dataset protocol. The source timestamps and recorded velocity fields are
+    intentionally not used.
+    """
+    pose_key = f"{agent_name}_pose"
+    if start_index >= len(steps) or n_waypoints <= 0:
+        return [], [], []
+    origin = steps[start_index].get(pose_key)
+    if not isinstance(origin, list) or len(origin) < 5:
+        return [], [], []
+    try:
+        origin_x = float(origin[0])
+        origin_y = float(origin[1])
+        origin_yaw = math.radians(float(origin[4]))
+    except (TypeError, ValueError):
+        return [], [], []
+
+    waypoints: List[List[float]] = []
+    valid_mask: List[bool] = []
+    source_indices: List[int] = []
+    last = [0.0, 0.0, 0.0]
+    for offset in range(n_waypoints):
+        index = start_index + offset
+        if index >= len(steps):
+            waypoints.append(last.copy())
+            valid_mask.append(False)
+            continue
+        pose = steps[index].get(pose_key)
+        if not isinstance(pose, list) or len(pose) < 5:
+            waypoints.append(last.copy())
+            valid_mask.append(False)
+            continue
+        try:
+            dx = (float(pose[0]) - origin_x) / 100.0
+            dy = (float(pose[1]) - origin_y) / 100.0
+            yaw = math.radians(float(pose[4]))
+        except (TypeError, ValueError):
+            waypoints.append(last.copy())
+            valid_mask.append(False)
+            continue
+        last = [
+            float(math.cos(origin_yaw) * dx + math.sin(origin_yaw) * dy),
+            float(-math.sin(origin_yaw) * dx + math.cos(origin_yaw) * dy),
+            float(wrap_radians(yaw - origin_yaw)),
+        ]
+        waypoints.append(last.copy())
+        # waypoint[0] is a structural origin and is excluded from prediction loss.
+        valid_mask.append(offset > 0)
+        source_indices.append(index)
+    return waypoints, valid_mask, source_indices
+
+
+def build_inverse_control_annotations(
+    drone_steps: List[Dict[str, Any]],
+    robotdog_steps: List[Dict[str, Any]],
+    n_waypoints: int,
+    cfg: InverseDynamicsConfig,
+    *,
+    drone_max_translation_command_mps: float,
+    drone_max_yaw_command_radps: float,
+    robotdog_max_speed_command_mps: float,
+    robotdog_max_yaw_command_radps: float,
+) -> List[Dict[str, Any]]:
+    """Roll GT command state once per episode and annotate every source row."""
+    count = min(len(drone_steps), len(robotdog_steps))
+    state, reference = initial_inverse_state()
+    annotations: List[Dict[str, Any]] = []
+    limits = np.asarray(
+        [
+            [drone_max_translation_command_mps, drone_max_translation_command_mps, drone_max_yaw_command_radps],
+            [robotdog_max_speed_command_mps, 0.0, robotdog_max_yaw_command_radps],
+        ],
+        dtype=np.float64,
+    )
+    for index in range(count):
+        drone_wp, drone_valid, _ = recorded_pose_waypoints(
+            drone_steps, "drone", index, n_waypoints
+        )
+        dog_wp, dog_valid, _ = recorded_pose_waypoints(
+            robotdog_steps, "robotdog", index, n_waypoints
+        )
+        state_before = state.copy()
+        reference_before = reference.copy()
+        result = inverse_step_numpy(
+            np.asarray([drone_wp, dog_wp], dtype=np.float64),
+            np.asarray([drone_valid, dog_valid], dtype=bool),
+            state_before,
+            reference_before,
+            cfg,
+        )
+        control = result["control"]
+        required_mask = result["valid_mask"].copy()
+        finite_mask = np.isfinite(control)
+        within_range = np.ones_like(required_mask)
+        within_range[0] = np.abs(control[0]) <= limits[0]
+        within_range[1, 0] = abs(float(control[1, 0])) <= limits[1, 0]
+        within_range[1, 1] = False
+        within_range[1, 2] = abs(float(control[1, 2])) <= limits[1, 2]
+        control_mask = required_mask & finite_mask & within_range
+        out_of_range = required_mask & ~within_range
+        annotations.append(
+            {
+                "inverse_control_version": INVERSE_CONTROL_VERSION,
+                "inverse_control_config": cfg.to_dict(),
+                "inverse_control_state_before": state_before.tolist(),
+                "inverse_control_reference_before": reference_before.tolist(),
+                "inverse_control_target": control.tolist(),
+                "inverse_env_action_target": result["env_action"].tolist(),
+                "inverse_raw_desired_velocity": result["raw_desired_velocity"].tolist(),
+                "inverse_desired_velocity": result["desired_velocity"].tolist(),
+                "inverse_control_valid_mask": control_mask.tolist(),
+                "inverse_control_out_of_range": out_of_range.tolist(),
+            }
+        )
+        # Roll command-side state even when an extreme control target is masked.
+        # This preserves temporal causality without reading realized UE state.
+        state = result["state_after"]
+        reference = result["reference_after"]
+    return annotations
+
+
+def multi_agent_quality_mask(
+    steps: List[Dict[str, Any]],
+    agent_name: str,
+    fallback_dt: float,
+    *,
+    min_dt: float,
+    max_dt: float,
+    max_after_action_gap_m: float,
+    exclude_snap_heading: bool,
+) -> List[bool]:
+    """Build a per-action validity mask for time-aligned supervision."""
+    pose_key = f"{agent_name}_pose"
+    after_key = f"{agent_name}_pose_after_action"
+    result: List[bool] = []
+    for index, step in enumerate(steps):
+        dt = multi_agent_step_dt(step, fallback_dt)
+        valid = math.isfinite(dt) and float(min_dt) <= dt <= float(max_dt)
+        valid = valid and not bool_multi_agent_field(step, "collision", False)
+        if exclude_snap_heading:
+            valid = valid and step.get("snap_heading") is not True
+        if max_after_action_gap_m >= 0.0 and index + 1 < len(steps):
+            gap = pose_xy_distance_m(step.get(after_key), steps[index + 1].get(pose_key))
+            valid = valid and gap is not None and gap <= float(max_after_action_gap_m)
+        result.append(bool(valid))
+    return result
+
+
+def load_manifest_episode_keys(path: Optional[str], split: str) -> set[str]:
+    if not path:
+        return set()
+    manifest_path = Path(path).expanduser().resolve()
+    with manifest_path.open("r", encoding="utf-8") as handle:
+        payload = json.load(handle)
+    items = payload.get(split, []) if isinstance(payload, dict) else []
+    if not isinstance(items, list):
+        raise ValueError(f"Manifest split {split!r} must be a list: {manifest_path}")
+    keys = set()
+    for item in items:
+        if isinstance(item, dict) and isinstance(item.get("key"), str):
+            keys.add(item["key"].strip("/"))
+    return keys
+
+
+def sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def load_manifest_info_hashes(path: Optional[str], split: str) -> set[str]:
+    """Hash manifest info files so flattened and raw episode ids can match."""
+    if not path:
+        return set()
+    manifest_path = Path(path).expanduser().resolve()
+    with manifest_path.open("r", encoding="utf-8") as handle:
+        payload = json.load(handle)
+    items = payload.get(split, []) if isinstance(payload, dict) else []
+    input_root_value = payload.get("input_root") if isinstance(payload, dict) else None
+    if not isinstance(items, list) or not isinstance(input_root_value, str):
+        raise ValueError(f"Manifest needs input_root and list split {split!r}: {manifest_path}")
+    input_root = Path(input_root_value).expanduser().resolve()
+    hashes: set[str] = set()
+    for item in items:
+        if not isinstance(item, dict) or not isinstance(item.get("info"), str):
+            continue
+        info_path = input_root / item["info"]
+        if not info_path.is_file():
+            raise FileNotFoundError(f"Manifest info file does not exist: {info_path}")
+        hashes.add(sha256_file(info_path))
+    return hashes
 
 
 def resample_multi_agent_waypoints(points: List[List[float]], n_waypoints: int) -> Tuple[List[List[float]], List[bool]]:
@@ -593,24 +980,7 @@ def normalize_multi_agent_bbox_xywh(raw_bbox: Any, width: int, height: int) -> L
 
     如果输入已经是 0-1 范围，会按 xywh_norm 解释后转成中心点形式。
     """
-    if not isinstance(raw_bbox, list) or len(raw_bbox) < 4:
-        return [0.0, 0.0, 0.0, 0.0]
-    try:
-        x, y, w, h = [float(v) for v in raw_bbox[:4]]
-    except Exception:
-        return [0.0, 0.0, 0.0, 0.0]
-
-    if max(abs(x), abs(y), abs(w), abs(h)) <= 1.5:
-        return [clamp01(x + 0.5 * w), clamp01(y + 0.5 * h), clamp01(w), clamp01(h)]
-
-    width = max(1, int(width))
-    height = max(1, int(height))
-    return [
-        clamp01((x + 0.5 * w) / width),
-        clamp01((y + 0.5 * h) / height),
-        clamp01(w / width),
-        clamp01(h / height),
-    ]
+    return normalize_bbox_xywh_to_cxcywh(raw_bbox, width, height)
 
 
 def read_multi_agent_image_size(path: Path, fallback_width: int, fallback_height: int) -> Tuple[int, int]:
@@ -638,6 +1008,17 @@ def float_multi_agent_field(step: Dict[str, Any], key: str, default: float = 0.0
         return default
 
 
+def raw_bbox_valid_xywh(value: Any) -> bool:
+    """Return whether a raw per-frame GT box can supervise bbox-dependent losses."""
+    try:
+        if not isinstance(value, (list, tuple)) or len(value) < 4:
+            return False
+        x, y, width, height = (float(item) for item in value[:4])
+        return all(math.isfinite(item) for item in (x, y, width, height)) and width > 0.0 and height > 0.0
+    except (TypeError, ValueError, OverflowError):
+        return False
+
+
 def make_multi_agent_rel_frame_paths(output_root: Path, frame_paths: Iterable[Path]) -> List[str]:
     """把绝对帧路径转为 JSON 中保存的相对路径。
 
@@ -646,9 +1027,15 @@ def make_multi_agent_rel_frame_paths(output_root: Path, frame_paths: Iterable[Pa
     rels: List[str] = []
     for path in frame_paths:
         try:
-            rel = path.resolve().relative_to(output_root.resolve())
+            # Preserve the logical path through a namespaced frame symlink.
+            # Resolving first would collapse data7_7 and data7_8_new episodes
+            # with equal scene/id names onto the same cache key.
+            rel = path.absolute().relative_to(output_root.absolute())
         except ValueError:
-            rel = path
+            try:
+                rel = path.resolve().relative_to(output_root.resolve())
+            except ValueError:
+                rel = path
         rels.append(rel.as_posix())
     return rels
 
@@ -674,32 +1061,34 @@ def build_multi_agent_payload(
     images_window: List[str],
     current_frame: str,
     step: Dict[str, Any],
-    actions_future: List[List[float]],
     waypoints: List[List[float]],
     valid_mask: List[bool],
-    bbox_norm: List[float],
+    image_width: int,
+    image_height: int,
 ) -> Dict[str, Any]:
     """构造 JSON 中单个 Agent 的结构化字段。
 
     这些字段同时服务两件事：
-    - 训练：读取 images/current/bbox/waypoints/valid_mask。
+    - 训练：只读取 images/current/waypoints/valid_mask。
     - 调试：保留 visibility、distance、pose 等原始采集信息，方便回查样本质量。
     """
     pose_key = f"{agent_name}_pose"
+    raw_bbox = step.get("target_bbox", [0, 0, 0, 0])
+    bbox = normalize_bbox_xywh_to_cxcywh(raw_bbox, image_width, image_height)
     return {
         "name": agent_name,
         "images": images_window,
         "current": current_frame,
-        "bbox": bbox_norm,
-        "bbox_format": "cxcywh_norm",
-        "bbox_raw_xywh": step.get("target_bbox", [0, 0, 0, 0]),
         "target_visible": bool_multi_agent_field(step, "target_visible", False),
+        "bbox": bbox,
+        "bbox_format": "cxcywh_norm",
+        "bbox_raw_xywh": raw_bbox,
+        "bbox_valid_mask": raw_bbox_valid_xywh(raw_bbox),
         "target_visibility": float_multi_agent_field(step, "target_visibility", 0.0),
         "target_center_error": float_multi_agent_field(step, "target_center_error", 0.0),
         "target_centered": bool_multi_agent_field(step, "target_centered", False),
         "target_distance": float_multi_agent_field(step, "dis_to_human", 0.0),
         "collision": bool_multi_agent_field(step, "collision", False),
-        "actions": actions_future,
         "waypoints": waypoints,
         "trajectory": waypoints,
         "valid_mask": valid_mask,
@@ -716,13 +1105,14 @@ def build_multi_agent_samples_for_episode(
     robotdog_frames: List[Path],
     drone_steps: List[Dict[str, Any]],
     robotdog_steps: List[Dict[str, Any]],
+    output_rel_run_dir: Optional[Path] = None,
 ) -> List[Dict[str, Any]]:
     """把一个双 Agent episode 转成多条滑动窗口训练样本。
 
     第 j 条样本的数据流：
     - 历史帧: [j-history, j)，分别来自无人机和机器狗两个视频。
     - 当前帧: j，用于 fine token 和 bbox。
-    - 标签: 从 j 开始积分未来 horizon 步动作，重采样成 n_waypoints。
+    - 标签: 直接读取原始 JSON 中未来记录 pose 并转成局部绝对 waypoint；不积分速度。
     - 输出: 同时写 agents 结构化字段和 agent1_/agent2_ 扁平字段。
     """
     agent_order = [args.agent1, args.agent2]
@@ -731,21 +1121,38 @@ def build_multi_agent_samples_for_episode(
 
     frame_map = {"drone": drone_frames, "robotdog": robotdog_frames}
     step_map = {"drone": drone_steps, "robotdog": robotdog_steps}
-    actions_map = {
-        "drone": build_multi_agent_actions(drone_steps, "drone", args.action_field),
-        "robotdog": build_multi_agent_actions(robotdog_steps, "robotdog", args.action_field),
+    waypoint_label_source = str(getattr(args, "waypoint_label_source", "recorded_pose_fixed_dt"))
+    if waypoint_label_source != "recorded_pose_fixed_dt":
+        raise ValueError(
+            "The global-image base dataset only supports waypoint_label_source="
+            "recorded_pose_fixed_dt; velocity integration is intentionally disabled."
+        )
+    history_frame_dt = float(args.dt)
+    filter_quality = bool(getattr(args, "filter_time_aligned_quality", False))
+    quality_masks = {
+        agent_name: multi_agent_quality_mask(
+            step_map[agent_name],
+            agent_name,
+            args.dt,
+            min_dt=float(getattr(args, "min_effective_dt", 0.0)),
+            max_dt=float(getattr(args, "max_effective_dt", float("inf"))),
+            max_after_action_gap_m=float(getattr(args, "max_after_action_gap_m", -1.0)),
+            exclude_snap_heading=bool(getattr(args, "exclude_snap_heading", False)),
+        )
+        for agent_name in ("drone", "robotdog")
     }
 
     max_len = min(len(drone_frames), len(robotdog_frames), len(drone_steps), len(robotdog_steps))
     if max_len <= 0:
         return []
 
-    drone_w, drone_h = read_multi_agent_image_size(drone_frames[0], args.fallback_width, args.fallback_height)
-    dog_w, dog_h = read_multi_agent_image_size(robotdog_frames[0], args.fallback_width, args.fallback_height)
-    size_map = {"drone": (drone_w, drone_h), "robotdog": (dog_w, dog_h)}
     rel_frames = {
         "drone": make_multi_agent_rel_frame_paths(output_root, drone_frames[:max_len]),
         "robotdog": make_multi_agent_rel_frame_paths(output_root, robotdog_frames[:max_len]),
+    }
+    image_sizes = {
+        agent_name: read_multi_agent_image_size(frame_map[agent_name][0], 640, 480)
+        for agent_name in ("drone", "robotdog")
     }
 
     instruction = load_multi_agent_instruction(ep, args.instruction)
@@ -753,17 +1160,17 @@ def build_multi_agent_samples_for_episode(
     horizon = max(1, int(args.horizon))
     n_waypoints = max(1, int(args.n_waypoints))
     dt = float(args.dt)
+    if abs(dt - 0.1) > 1e-8:
+        raise ValueError("recorded_pose_fixed_dt requires --dt 0.1")
     samples: List[Dict[str, Any]] = []
 
     for j in range(max_len):
-        if (not args.allow_partial_horizon) and (j + horizon > max_len):
-            continue
+        history_indices = list(range(max(0, j - history), j))
 
         agents: Dict[str, Dict[str, Any]] = {}
         skip = False
         for agent_name in ("drone", "robotdog"):
             steps = step_map[agent_name]
-            actions = actions_map[agent_name]
             frame_rels = rel_frames[agent_name]
             step = steps[j]
 
@@ -777,63 +1184,87 @@ def build_multi_agent_samples_for_episode(
                 skip = True
                 break
 
-            start_idx = max(0, j - history)
-            images_window = frame_rels[start_idx:j]
+            images_window = [frame_rels[index] for index in history_indices]
             current_frame = frame_rels[j]
-            future_actions = actions[j : min(len(actions), j + horizon)]
-            points = integrate_multi_agent_actions(actions, j, horizon, dt)
-            waypoints, valid_mask = resample_multi_agent_waypoints(points, n_waypoints)
-            if (not args.allow_partial_horizon) and not all(valid_mask):
+            waypoints, valid_mask, source_action_indices = recorded_pose_waypoints(
+                steps,
+                agent_name,
+                j,
+                n_waypoints,
+            )
+            future_dts = [dt for _ in source_action_indices]
+            prediction_mask = valid_mask[1:]
+            if (not args.allow_partial_horizon) and not all(prediction_mask):
+                skip = True
+                break
+            if (not args.allow_partial_horizon) and len(waypoints) != n_waypoints:
                 skip = True
                 break
 
-            width, height = size_map[agent_name]
-            bbox = normalize_multi_agent_bbox_xywh(step.get("target_bbox"), width, height)
+            if filter_quality:
+                quality_indices = list(source_action_indices)
+                if not quality_indices:
+                    skip = True
+                    break
+                if bool(getattr(args, "quality_filter_history", False)) and history_indices:
+                    quality_indices = list(range(history_indices[0], source_action_indices[-1] + 1))
+                mask = quality_masks[agent_name]
+                if any(index >= len(mask) or not mask[index] for index in quality_indices):
+                    skip = True
+                    break
+
             agents[agent_name] = build_multi_agent_payload(
                 agent_name,
                 images_window,
                 current_frame,
                 step,
-                future_actions,
                 waypoints,
                 valid_mask,
-                bbox,
+                image_sizes[agent_name][0],
+                image_sizes[agent_name][1],
             )
+            agents[agent_name]["action_dts"] = future_dts
+            agents[agent_name]["source_action_indices"] = source_action_indices
+            agents[agent_name]["history_source_indices"] = history_indices
+            agents[agent_name]["waypoint_times_s"] = [index * dt for index in range(len(waypoints))]
+            agents[agent_name]["waypoint_label_source"] = waypoint_label_source
 
         if skip:
             continue
 
         a1, a2 = agent_order
+        sample_rel_run_dir = output_rel_run_dir or ep.rel_run_dir
         sample = {
-            "schema_version": MULTI_AGENT_SCHEMA_VERSION,
-            "episode_id": f"{ep.rel_run_dir.as_posix()}/{ep.stem}",
+            "schema_version": RECORDED_POSE_SCHEMA_VERSION,
+            "episode_id": f"{sample_rel_run_dir.as_posix()}/{ep.stem}",
             "episode_stem": ep.stem,
-            "rel_run_dir": ep.rel_run_dir.as_posix(),
+            "rel_run_dir": sample_rel_run_dir.as_posix(),
             "step_index": j,
             "instruction": instruction,
             "dt": dt,
             "history": history,
             "horizon": horizon,
             "n_waypoints": n_waypoints,
+            "time_alignment": "recorded_row_index_assumed_fixed_dt",
+            "waypoint_label_source": waypoint_label_source,
+            "history_frame_dt_s": history_frame_dt,
+            "waypoint_dt_s": dt,
             "agent_order": agent_order,
             "agents": agents,
             "agent1_name": a1,
             "agent2_name": a2,
             "agent1_images": agents[a1]["images"],
             "agent1_current": agents[a1]["current"],
-            "agent1_bbox": agents[a1]["bbox"],
-            "agent1_actions": agents[a1]["actions"],
             "agent1_waypoints": agents[a1]["waypoints"],
             "agent1_valid_mask": agents[a1]["valid_mask"],
             "agent2_images": agents[a2]["images"],
             "agent2_current": agents[a2]["current"],
-            "agent2_bbox": agents[a2]["bbox"],
-            "agent2_actions": agents[a2]["actions"],
             "agent2_waypoints": agents[a2]["waypoints"],
             "agent2_valid_mask": agents[a2]["valid_mask"],
-            "bbox_feat": [agents[a1]["bbox"], agents[a2]["bbox"]],
             "waypoints": [agents[a1]["waypoints"], agents[a2]["waypoints"]],
             "valid_mask": [agents[a1]["valid_mask"], agents[a2]["valid_mask"]],
+            "bbox_feat": [agents[a1]["bbox"], agents[a2]["bbox"]],
+            "bbox_valid_mask": [agents[a1]["bbox_valid_mask"], agents[a2]["bbox_valid_mask"]],
         }
         samples.append(sample)
 
@@ -858,22 +1289,27 @@ def parse_multi_agent_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Build two-agent TrackVLA JSONL data from UnrealZoo aerial-ground episodes.")
     parser.add_argument("--input_root", type=str, required=True, help="Root containing *_drone_info.json and *_robotdog_info.json pairs.")
     parser.add_argument("--output_root", type=str, required=True, help="Output training data root.")
+    parser.add_argument(
+        "--output_prefix",
+        type=str,
+        default="",
+        help="Relative namespace below frames/ and jsonl/ for multi-source datasets.",
+    )
     parser.add_argument("--history", type=int, default=31)
-    parser.add_argument("--horizon", type=int, default=8, help="Number of future velocity steps used to build waypoints.")
+    parser.add_argument("--horizon", type=int, default=8, help="Metadata only; waypoint labels use the recorded-pose horizon.")
     parser.add_argument("--n_waypoints", type=int, default=8)
     parser.add_argument("--dt", type=float, default=0.1)
-    parser.add_argument("--agent1", type=str, default="drone", choices=["drone", "robotdog"])
-    parser.add_argument("--agent2", type=str, default="robotdog", choices=["drone", "robotdog"])
     parser.add_argument(
-        "--action_field",
-        type=str,
-        default=ACTION_FIELD_AUTO,
+        "--waypoint_label_source",
+        choices=("recorded_pose_fixed_dt",),
+        default="recorded_pose_fixed_dt",
         help=(
-            "Preferred action field in each *_info.json step. Default auto uses "
-            "commanded_base_velocity for current UnrealZoo rows and base_velocity "
-            "for legacy/Habitat rows."
+            "Use consecutive recorded agent poses directly as local absolute waypoints; "
+            "velocity integration is disabled for the global-image base dataset."
         ),
     )
+    parser.add_argument("--agent1", type=str, default="drone", choices=["drone", "robotdog"])
+    parser.add_argument("--agent2", type=str, default="robotdog", choices=["drone", "robotdog"])
     parser.add_argument("--instruction", type=str, default=None)
     parser.add_argument("--only_success", action="store_true")
     parser.add_argument("--exclude_collision", action="store_true")
@@ -891,6 +1327,25 @@ def parse_multi_agent_args() -> argparse.Namespace:
     parser.add_argument("--out_file", type=str, default=None, help="Aggregated dataset JSON. Defaults to <output_root>/dataset.json.")
     parser.add_argument("--no_aggregate", action="store_true", help="Do not write aggregated dataset JSON.")
     parser.add_argument("--max_episodes", type=int, default=0)
+    parser.add_argument("--exclude_manifest", type=str, default=None, help="Manifest whose selected split is excluded by episode key.")
+    parser.add_argument("--exclude_manifest_split", type=str, default="test")
+    parser.add_argument(
+        "--exclude_content_manifest",
+        type=str,
+        default=None,
+        help="Exclude episodes whose drone info SHA256 matches the selected manifest split.",
+    )
+    parser.add_argument("--fixed_time_resampling", action="store_true")
+    parser.add_argument("--history_frame_dt", type=float, default=0.0)
+    parser.add_argument("--filter_time_aligned_quality", action="store_true")
+    parser.add_argument("--quality_filter_history", action="store_true")
+    parser.add_argument("--min_effective_dt", type=float, default=0.09)
+    parser.add_argument("--max_effective_dt", type=float, default=0.14)
+    parser.add_argument("--max_after_action_gap_m", type=float, default=0.05)
+    parser.add_argument("--exclude_snap_heading", action="store_true")
+    parser.add_argument("--require_fixed_dt", action="store_true", help="Skip episodes containing rows outside dt tolerance.")
+    parser.add_argument("--fixed_dt_tolerance", type=float, default=1e-4)
+    parser.add_argument("--prune_stale_jsonl", action="store_true", help="Delete JSONL files not written by this run.")
     parser.add_argument("--dry_run", action="store_true", help="Only scan paired episodes; do not extract frames or write samples.")
     return parser.parse_args()
 
@@ -911,11 +1366,26 @@ def main_multi_agent() -> None:
 
     input_root = Path(args.input_root).resolve()
     output_root = Path(args.output_root).resolve()
+    output_prefix = Path(args.output_prefix.strip()) if args.output_prefix.strip() else Path()
+    if output_prefix.is_absolute() or ".." in output_prefix.parts:
+        raise ValueError(f"--output_prefix must be a safe relative path: {args.output_prefix!r}")
     frames_root = output_root / "frames"
     jsonl_root = output_root / "jsonl"
     out_file = Path(args.out_file).resolve() if args.out_file else (output_root / "dataset.json")
 
     episodes = collect_multi_agent_paired_episodes(input_root)
+    excluded_keys = load_manifest_episode_keys(args.exclude_manifest, args.exclude_manifest_split)
+    if excluded_keys:
+        episodes = [
+            ep for ep in episodes
+            if f"{ep.rel_run_dir.as_posix()}/{ep.stem}" not in excluded_keys
+        ]
+        print(f"Excluded manifest episodes: {len(excluded_keys)}")
+    excluded_hashes = load_manifest_info_hashes(args.exclude_content_manifest, args.exclude_manifest_split)
+    if excluded_hashes:
+        before = len(episodes)
+        episodes = [ep for ep in episodes if sha256_file(ep.drone_info_json) not in excluded_hashes]
+        print(f"Excluded content-matched episodes: {before - len(episodes)} / {len(excluded_hashes)} hashes")
     if args.max_episodes > 0:
         episodes = episodes[: args.max_episodes]
 
@@ -941,6 +1411,7 @@ def main_multi_agent() -> None:
     skipped_load = 0
     skipped_empty = 0
     all_samples: List[Dict[str, Any]] = []
+    written_paths: set[Path] = set()
 
     for ep in episodes:
         if not should_keep_multi_agent_episode(
@@ -962,16 +1433,42 @@ def main_multi_agent() -> None:
             print(f"[WARN] failed to load info for {ep.rel_run_dir.as_posix()}/{ep.stem}: {exc}")
             continue
 
-        rel_episode_dir = ep.rel_run_dir / ep.stem
+        if args.require_fixed_dt:
+            expected_dt = float(args.dt)
+            tolerance = max(0.0, float(args.fixed_dt_tolerance))
+            all_step_dts = [
+                multi_agent_step_dt(step, expected_dt)
+                for step in (drone_steps + robotdog_steps)
+            ]
+            if any(abs(value - expected_dt) > tolerance for value in all_step_dts):
+                skipped_empty += 1
+                print(
+                    f"[SKIP] {ep.rel_run_dir.as_posix()}/{ep.stem}: "
+                    f"non-fixed dt outside {expected_dt:.6f}+/-{tolerance:.6f}s"
+                )
+                continue
+
+        output_rel_run_dir = output_prefix / ep.rel_run_dir
+        rel_episode_dir = output_rel_run_dir / ep.stem
         drone_frame_dir = frames_root / rel_episode_dir / "drone"
         robotdog_frame_dir = frames_root / rel_episode_dir / "robotdog"
 
         try:
             drone_frames = extract_multi_agent_frames_ffmpeg(
-                ffmpeg_path, ep.drone_mp4, drone_frame_dir, args.ffmpeg_quality, args.reuse_existing_frames
+                ffmpeg_path,
+                ep.drone_mp4,
+                drone_frame_dir,
+                args.ffmpeg_quality,
+                args.reuse_existing_frames,
+                expected_count=len(drone_steps),
             )
             robotdog_frames = extract_multi_agent_frames_ffmpeg(
-                ffmpeg_path, ep.robotdog_mp4, robotdog_frame_dir, args.ffmpeg_quality, args.reuse_existing_frames
+                ffmpeg_path,
+                ep.robotdog_mp4,
+                robotdog_frame_dir,
+                args.ffmpeg_quality,
+                args.reuse_existing_frames,
+                expected_count=len(robotdog_steps),
             )
         except subprocess.CalledProcessError as exc:
             skipped_load += 1
@@ -979,23 +1476,43 @@ def main_multi_agent() -> None:
             continue
 
         samples = build_multi_agent_samples_for_episode(
-            ep, args, output_root, drone_frames, robotdog_frames, drone_steps, robotdog_steps
+            ep,
+            args,
+            output_root,
+            drone_frames,
+            robotdog_frames,
+            drone_steps,
+            robotdog_steps,
+            output_rel_run_dir=output_rel_run_dir,
         )
         if not samples:
             skipped_empty += 1
             continue
 
-        jsonl_path = jsonl_root / ep.rel_run_dir / f"{ep.stem}.jsonl"
+        jsonl_path = jsonl_root / output_rel_run_dir / f"{ep.stem}.jsonl"
         write_multi_agent_jsonl(jsonl_path, samples)
+        written_paths.add(jsonl_path.resolve())
         written_jsonl += 1
         written_samples += len(samples)
         if not args.no_aggregate:
             all_samples.extend(samples)
-        print(f"[OK] {ep.rel_run_dir.as_posix()}/{ep.stem}: samples={len(samples)}")
+        print(f"[OK] {output_rel_run_dir.as_posix()}/{ep.stem}: samples={len(samples)}")
 
     if (not args.no_aggregate) and all_samples:
         with out_file.open("w", encoding="utf-8") as f:
             json.dump(all_samples, f, ensure_ascii=False)
+
+    if args.prune_stale_jsonl and written_jsonl == 0:
+        raise RuntimeError(
+            "Refusing to prune JSONL because this preprocessing run wrote zero episodes. "
+            "Check the fixed-dt filter and split manifest."
+        )
+    if args.prune_stale_jsonl:
+        prune_root = jsonl_root / output_prefix
+        stale_paths = [path for path in prune_root.rglob("*.jsonl") if path.resolve() not in written_paths]
+        for path in stale_paths:
+            path.unlink()
+        print(f"Pruned stale JSONL files: {len(stale_paths)}")
 
     print(f"Kept episodes: {kept}")
     print(f"Written JSONL files: {written_jsonl}")
@@ -1060,8 +1577,9 @@ def main():
         type=str,
         default=ACTION_FIELD_AUTO,
         help=(
-            "Preferred action field. Auto uses commanded_base_velocity for current "
-            "UnrealZoo rows and base_velocity for legacy/Habitat rows."
+            "Preferred action field. Auto uses base_velocity first; pass "
+            "commanded_base_velocity explicitly to use current UnrealZoo controller "
+            "command labels."
         ),
     )
     args = parser.parse_args()
@@ -1148,6 +1666,7 @@ def main():
 
         # Build relative paths for JSON for all frames (no skipping)
         rel_frame_paths = [str((Path("frames") / rel_frames_dir / p.name).as_posix()) for p in frame_paths]
+        image_width, image_height = read_multi_agent_image_size(frame_paths[0], 640, 480)
 
         # Build sliding-window samples
         history = max(0, int(args.history))
@@ -1176,12 +1695,23 @@ def main():
                 step_info = steps[j] if j < len(steps) else {}
                 collision_flag = bool(step_info.get("collision", False))
                 target_distance = step_info.get("target_distance", step_info.get("dis_to_human", 0.0))
+                bbox = normalize_bbox_xywh_to_cxcywh(step_info.get("target_bbox"), image_width, image_height)
+                prev_bbox = None
+                if j > 0 and j - 1 < len(steps):
+                    prev_step = steps[j - 1]
+                    prev_bbox = normalize_bbox_xywh_to_cxcywh(prev_step.get("target_bbox"), image_width, image_height)
+                spatial = bbox_spatial_fields(bbox, prev_bbox)
                 sample = {
                     "images": images_window,
                     "current": current_frame,
                     "instruction": instruction_text,
                     "trajectory": traj,
                     "actions": future_actions,
+                    "bbox": bbox,
+                    "bbox_format": "cxcywh_norm",
+                    "bbox_raw_xywh": step_info.get("target_bbox", [0, 0, 0, 0]),
+                    "bbox_spatial": spatial,
+                    "bbox_prompt_text": bbox_prompt_from_spatial([spatial], [args.agent]),
                     "collision": collision_flag,
                     "target_distance": float(target_distance) if target_distance is not None else 0.0,
                 }

@@ -3,8 +3,26 @@
     "python-envs.defaultEnvManager": "ms-python.python:conda",
     "python-envs.defaultPackageManager": "ms-python.python:conda",
     "python.analysis.extraPaths": [
-        "./habitat-lab",
         "./unrealzoo-gym",
         "./unrealzoo-gym/example/DataRecording"
-    ]
+    ],
+    "python.analysis.exclude": [
+        "**/__pycache__",
+        "output/**",
+        "offline_detection_segmentation/outputs/**",
+        "offline_detection_segmentation_adapter/**",
+        "yolo_person_finetuning/data/**",
+        "yolo_person_finetuning/data_smoke/**",
+        "yolo_person_finetuning/outputs/**"
+    ],
+    "python.analysis.diagnosticMode": "openFilesOnly",
+    "python.analysis.indexing": false,
+    "files.watcherExclude": {
+        "**/output/**": true,
+        "**/offline_detection_segmentation/outputs/**": true,
+        "**/offline_detection_segmentation_adapter/**": true,
+        "**/yolo_person_finetuning/data/**": true,
+        "**/yolo_person_finetuning/data_smoke/**": true,
+        "**/yolo_person_finetuning/outputs/**": true
+    }
 }
